@@ -215,57 +215,72 @@ def build_ob_heatmap(
     price_lo: float,
     price_hi: float,
     price_bin: float,
-) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """Build per-candle orderbook heatmap arrays for pcolormesh rendering.
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Build 1-minute resolution orderbook heatmap arrays for pcolormesh.
 
-    Returns (price_bins, bid_heatmap, ask_heatmap) where:
+    Returns (x_positions, price_bins, bid_heatmap, ask_heatmap) where:
+      - x_positions: 1D array of x-edge positions (n_min_buckets + 1) for pcolormesh
       - price_bins: 1D array of price bin centers
-      - bid_heatmap: (n, n_bins) array of normalized bid depth [0..1]
-      - ask_heatmap: (n, n_bins) array of normalized ask depth [0..1]
-    Returns (None, None, None) on failure.
+      - bid_heatmap: (n_min_buckets, n_bins) array of normalized bid depth [0..1]
+      - ask_heatmap: (n_min_buckets, n_bins) array of normalized ask depth [0..1]
+    Returns all None on failure.
     """
     if book_df.empty or candles.empty:
-        return None, None, None
+        return None, None, None, None
 
-    n = len(candles)
+    n_candles = len(candles)
+    start_ts = candles["ts"].iloc[0]
+    end_ts = candles["ts"].iloc[-1]
+
+    # 1-minute buckets
+    one_min = pd.Timedelta(minutes=1)
+    buckets = pd.date_range(start=start_ts, end=end_ts, freq="1min")
+    if len(buckets) < 2:
+        return None, None, None, None
+
+    n_buckets = len(buckets)
+    bucket_times = buckets.values.astype("datetime64[us]")
+
+    # Fractional x position for each bucket (linear map 0..n_candles-1)
+    total_sec = (end_ts - start_ts).total_seconds()
+    x_positions = np.linspace(-0.5, n_candles - 1 + 0.5, n_buckets + 1)
+
     price_bins = np.arange(
         (price_lo // price_bin) * price_bin,
         (price_hi // price_bin) * price_bin + price_bin,
         price_bin
     )
     if len(price_bins) == 0:
-        return None, None, None
+        return None, None, None, None
 
-    bid_hm = np.full((n, len(price_bins)), np.nan)
-    ask_hm = np.full((n, len(price_bins)), np.nan)
-
-    candle_times = candles["ts"].values.astype("datetime64[us]")
+    bid_hm = np.full((n_buckets, len(price_bins)), np.nan)
+    ask_hm = np.full((n_buckets, len(price_bins)), np.nan)
 
     for _, brow in book_df.iterrows():
         bt = brow["ts"].to_datetime64() if hasattr(brow["ts"], "to_datetime64") else np.datetime64(brow["ts"], "us")
-        diffs = np.abs(candle_times - bt)
-        ci = diffs.argmin()
+        diffs = np.abs(bucket_times - bt)
+        bi = diffs.argmin()
         min_diff_sec = diffs.min().astype("timedelta64[s]").astype(int)
         if min_diff_sec > 300:
-            continue  # too far from any candle
+            continue  # too far from any bucket
 
         for p_str, qty in brow.get("bids_bucketed", {}).items():
             p = float(p_str)
-            bi = int((p - price_bins[0]) / price_bin)
-            if 0 <= bi < len(price_bins):
-                if np.isnan(bid_hm[ci, bi]):
-                    bid_hm[ci, bi] = 0
-                bid_hm[ci, bi] += float(qty)
+            pi = int((p - price_bins[0]) / price_bin)
+            if 0 <= pi < len(price_bins):
+                if np.isnan(bid_hm[bi, pi]):
+                    bid_hm[bi, pi] = 0
+                bid_hm[bi, pi] += float(qty)
 
         for p_str, qty in brow.get("asks_bucketed", {}).items():
             p = float(p_str)
-            bi = int((p - price_bins[0]) / price_bin)
-            if 0 <= bi < len(price_bins):
-                if np.isnan(ask_hm[ci, bi]):
-                    ask_hm[ci, bi] = 0
-                ask_hm[ci, bi] += float(qty)
+            pi = int((p - price_bins[0]) / price_bin)
+            if 0 <= pi < len(price_bins):
+                if np.isnan(ask_hm[bi, pi]):
+                    ask_hm[bi, pi] = 0
+                ask_hm[bi, pi] += float(qty)
 
-    return price_bins, bid_hm, ask_hm
+    return x_positions, price_bins, bid_hm, ask_hm
 
 
 # ── Rendering ───────────────────────────────────────────────────────────────
@@ -346,7 +361,7 @@ def render_footprint_chart(
 
     # ├─ Orderbook heatmap background (per-candle) ──
     if book_heatmap is not None:
-        price_bins_hm, bid_hm, ask_hm = book_heatmap
+        x_pos_hm, price_bins_hm, bid_hm, ask_hm = book_heatmap
         if bid_hm is not None and ask_hm is not None:
             hm_bid_max = max(np.nanmax(bid_hm), 1.0)
             hm_ask_max = max(np.nanmax(ask_hm), 1.0)
@@ -360,7 +375,12 @@ def render_footprint_chart(
                 'ask_hm', [(0, 0, 0, 0), (0.65, 0.15, 0.15, 1)], N=256)
             cmap_ask.set_bad(alpha=0)
 
-            X, Y = np.meshgrid(np.arange(n) - 0.5, price_bins_hm)
+            # Y edge positions for pcolormesh (n_bins + 1 edges)
+            y_edges = np.append(
+                price_bins_hm - DEFAULT_PRICE_BIN / 2,
+                price_bins_hm[-1] + DEFAULT_PRICE_BIN / 2
+            )
+            X, Y = np.meshgrid(x_pos_hm, y_edges)
             ax_main.pcolormesh(X, Y, bid_norm, cmap=cmap_bid,
                                alpha=1.0, shading='auto', zorder=0,
                                linewidth=0, edgecolor='none')
@@ -678,8 +698,9 @@ def main():
                     price_lo - pad, price_hi + pad,
                     args.price_bin,
                 )
-                if book_heatmap[0] is not None:
-                    print(f"  OB heatmap: {book_heatmap[0].shape[0]} price bins x {len(candles)} candles")
+                if book_heatmap is not None and book_heatmap[1] is not None:
+                    pb, n_buckets = book_heatmap[1].shape[0], book_heatmap[2].shape[0]
+                    print(f"  OB heatmap: {pb} price bins x {n_buckets} 1min buckets")
     else:
         print("  book file not found")
 
