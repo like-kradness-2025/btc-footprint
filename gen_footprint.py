@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.ticker import FuncFormatter
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 
 # ── Color palette (navy dark) ──────────────────────────────────────────────
 NAVY = "#07111f"
@@ -55,7 +55,7 @@ SPINE = "#3a5a7a"
 DEFAULT_PRICE_BIN = 10        # USD
 DEFAULT_HOURS = 3             # data window
 DEFAULT_TARGET_INTERVAL = 15  # minutes
-DEFAULT_CANDLES = 13          # display count (13 = 3h15m for 15min candles)
+DEFAULT_CANDLES = 12          # display count
 CANDLE_WIDTH = 0.19
 GAP = 0.05
 FP_WIDTH = 0.75               # max footprint bar width in index units
@@ -72,52 +72,70 @@ except ImportError:
 
 # ── Data loading ────────────────────────────────────────────────────────────
 
-def load_trades_compact(path: Path) -> pd.DataFrame:
+def _load_jsonl_tail(path: Path, hours: float) -> pd.DataFrame:
+    """Load only the last N hours from a JSONL file (read from end efficiently)."""
+    import subprocess
+    # Find approximate byte position for N hours of data - read last 100MB
+    # The receiver generates ~1-2MB/min, so 100MB covers ~50-100min
+    byte_count = 100 * 1024 * 1024
+    result = subprocess.run(
+        ["tail", "-c", str(byte_count), str(path)],
+        capture_output=True, timeout=30
+    )
+    lines = result.stdout.decode("utf-8", errors="replace").splitlines()
+    # First line may be truncated; skip it if we're not at file start
+    file_size = path.stat().st_size
+    if file_size > byte_count:
+        lines = lines[1:]  # skip truncated first line
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=hours)
     rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-    return df
-
-
-def load_book_bucketed(path: Path) -> pd.DataFrame:
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
             d = json.loads(line)
-            if isinstance(d, list):
-                continue
+        except json.JSONDecodeError:
+            continue
+        ts_str = d.get("ts") or d.get("timestamp")
+        if ts_str is None:
+            continue
+        ts = pd.to_datetime(ts_str)
+        if ts >= cutoff:
+            d["_ts_parsed"] = ts  # store parsed timestamp for later conversion
             rows.append(d)
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    if "_ts_parsed" in df.columns:
+        df["ts"] = df["_ts_parsed"]
+        df.drop(columns=["_ts_parsed"], inplace=True)
+    else:
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    return df
+
+
+def load_trades_compact(path: Path) -> pd.DataFrame:
+    return _load_jsonl_tail(path, DEFAULT_HOURS)
+
+
+def load_book_bucketed(path: Path) -> pd.DataFrame:
+    df = _load_jsonl_tail(path, DEFAULT_HOURS)
+    if df.empty:
+        return df
+    # Book file may have array-typed rows; skip those
+    # (they become object dtype columns - we only want dict rows)
+    # Check if any column is entirely objects (likely from arrays mixing in)
+    for col in df.columns:
+        if df[col].dtype == object and df[col].apply(lambda x: isinstance(x, list)).any():
+            df = df[~df[col].apply(lambda x: isinstance(x, list))]
     return df
 
 
 def load_features(path: Path) -> pd.DataFrame:
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            d = json.loads(line)
-            rows.append({"ts": d["ts"], "mid": d.get("mid")})
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df = _load_jsonl_tail(path, DEFAULT_HOURS)
+    if df.empty:
+        return df
     df["mid"] = pd.to_numeric(df["mid"], errors="coerce")
     return df.dropna(subset=["mid"])
 
@@ -301,6 +319,8 @@ def render_footprint_chart(
     symbol: str = "BTCUSDT",
     title: str = "BTC Footprint + Orderbook",
     out_path: str | Path | None = None,
+    interval_label: str = "15m",
+    display_candles: int = DEFAULT_CANDLES,
 ) -> tuple[plt.Figure, plt.Axes]:
     """Render footprint chart with bid=green / ask=red heatmap.
 
@@ -313,7 +333,7 @@ def render_footprint_chart(
         ax.text(0.5, 0.5, "No data", ha="center", va="center", color="white")
         return fig, ax
 
-    n = min(len(candles), DEFAULT_CANDLES)
+    n = min(len(candles), display_candles)
     candles = candles.tail(n).reset_index(drop=True)
     x_idx = np.arange(n)  # 0, 1, 2, ..., n-1
 
@@ -368,11 +388,22 @@ def render_footprint_chart(
             bid_norm = bid_hm.T / hm_bid_max
             ask_norm = ask_hm.T / hm_ask_max
 
-            cmap_bid = LinearSegmentedColormap.from_list(
-                'bid_hm', [(0, 0, 0, 0), (0.15, 0.65, 0.15, 1)], N=256)
+            # Custom colormaps: transparent at 0 → vivid color at max
+            # Cubic alpha curve: low depth nearly transparent, thick depth pops
+            n_c = 256
+            bid_clr = np.zeros((n_c, 4))
+            ask_clr = np.zeros((n_c, 4))
+            bid_clr[:, 0] = np.linspace(0, 0.10, n_c)  # R
+            bid_clr[:, 1] = np.linspace(0, 0.75, n_c)  # G
+            bid_clr[:, 2] = np.linspace(0, 0.20, n_c)  # B
+            bid_clr[:, 3] = np.linspace(0, 1, n_c) ** 3  # A: cubic
+            ask_clr[:, 0] = np.linspace(0, 0.80, n_c)  # R
+            ask_clr[:, 1] = np.linspace(0, 0.15, n_c)  # G
+            ask_clr[:, 2] = np.linspace(0, 0.15, n_c)  # B
+            ask_clr[:, 3] = np.linspace(0, 1, n_c) ** 3  # A: cubic
+            cmap_bid = ListedColormap(bid_clr, 'bid_hm')
+            cmap_ask = ListedColormap(ask_clr, 'ask_hm')
             cmap_bid.set_bad(alpha=0)
-            cmap_ask = LinearSegmentedColormap.from_list(
-                'ask_hm', [(0, 0, 0, 0), (0.65, 0.15, 0.15, 1)], N=256)
             cmap_ask.set_bad(alpha=0)
 
             # Y edge positions for pcolormesh (n_bins + 1 edges)
@@ -476,7 +507,7 @@ def render_footprint_chart(
     last = candles.iloc[-1]
     lp = last["close"]
     lc = UP if last["close"] >= last["open"] else DOWN
-    ax_main.text(0.02, 0.97, f"{lp:,.0f}", transform=ax_main.transAxes,
+    ax_main.text(0.02, 0.97, f"{lp:,.0f}  {interval_label}", transform=ax_main.transAxes,
                  fontsize=18, fontweight="bold", color=lc, va="top", ha="left",
                  bbox=dict(boxstyle="round,pad=0.2", fc="black", ec=lc, lw=0.8, alpha=0.75),
                  zorder=6)
@@ -622,6 +653,8 @@ def main():
                         help="Price bucket size in USD (default: 10)")
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--title", default="BTC Footprint + Orderbook")
+    parser.add_argument("--candles", type=int, default=DEFAULT_CANDLES,
+                        help="Number of candles to display (default: 12)")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -677,6 +710,10 @@ def main():
         candles["close"] = candles["ts"]
         print(f"  {len(candles)} candles from trade fallback")
 
+    # Limit to display count BEFORE building OB heatmap
+    candles = candles.tail(args.candles).reset_index(drop=True)
+    print(f"  limited to {len(candles)} candles for display")
+
     print("Loading orderbook...")
     ob_data = None
     book_heatmap = None
@@ -688,11 +725,11 @@ def main():
                 print(f"  OB snapshot at {ob_data['ts']}, {len(ob_data['bids'])} bids, {len(ob_data['asks'])} asks")
             else:
                 print("  no OB snapshot in window")
-            # Build per-candle heatmap
+            # Build per-candle heatmap from DISPLAY candles only
             if not candles.empty:
                 price_lo = candles["low"].min()
                 price_hi = candles["high"].max()
-                pad = (price_hi - price_lo) * 0.05
+                pad = max(50, (price_hi - price_lo) * 0.12)  # match render y-axis padding
                 book_heatmap = build_ob_heatmap(
                     books, candles,
                     price_lo - pad, price_hi + pad,
@@ -711,6 +748,8 @@ def main():
         symbol=args.symbol,
         title=args.title,
         out_path=args.out,
+        interval_label=f"{args.target_minutes}m",
+        display_candles=args.candles,
     )
     print("Done.")
 
