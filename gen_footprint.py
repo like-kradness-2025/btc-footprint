@@ -35,6 +35,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.ticker import FuncFormatter
+from matplotlib.colors import LinearSegmentedColormap
 
 # ── Color palette (navy dark) ──────────────────────────────────────────────
 NAVY = "#07111f"
@@ -44,6 +45,8 @@ TEXT = "#ecf3fe"
 MUTED = "#96a8bf"
 BID_GREEN = "#22c55e"  # solid green for bid volume
 ASK_RED = "#ef4444"    # solid red for ask volume
+DELTA_BID = "#38bdf8"  # light blue for delta-bid
+DELTA_ASK = "#f97316"  # orange for delta-ask
 UP = "#4ade80"
 DOWN = "#f43f5e"
 SPINE = "#3a5a7a"
@@ -53,7 +56,7 @@ DEFAULT_PRICE_BIN = 10        # USD
 DEFAULT_HOURS = 3             # data window
 DEFAULT_TARGET_INTERVAL = 15  # minutes
 DEFAULT_CANDLES = 13          # display count (13 = 3h15m for 15min candles)
-CANDLE_WIDTH = 0.38
+CANDLE_WIDTH = 0.19
 GAP = 0.05
 FP_WIDTH = 0.75               # max footprint bar width in index units
 MIN_ALPHA = 0.08
@@ -206,6 +209,65 @@ def build_orderbook_depth(
     return {"mid": mid, "bids": bids, "asks": asks, "ts": latest["ts"]}
 
 
+def build_ob_heatmap(
+    book_df: pd.DataFrame,
+    candles: pd.DataFrame,
+    price_lo: float,
+    price_hi: float,
+    price_bin: float,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Build per-candle orderbook heatmap arrays for pcolormesh rendering.
+
+    Returns (price_bins, bid_heatmap, ask_heatmap) where:
+      - price_bins: 1D array of price bin centers
+      - bid_heatmap: (n, n_bins) array of normalized bid depth [0..1]
+      - ask_heatmap: (n, n_bins) array of normalized ask depth [0..1]
+    Returns (None, None, None) on failure.
+    """
+    if book_df.empty or candles.empty:
+        return None, None, None
+
+    n = len(candles)
+    price_bins = np.arange(
+        (price_lo // price_bin) * price_bin,
+        (price_hi // price_bin) * price_bin + price_bin,
+        price_bin
+    )
+    if len(price_bins) == 0:
+        return None, None, None
+
+    bid_hm = np.full((n, len(price_bins)), np.nan)
+    ask_hm = np.full((n, len(price_bins)), np.nan)
+
+    candle_times = candles["ts"].values.astype("datetime64[us]")
+
+    for _, brow in book_df.iterrows():
+        bt = brow["ts"].to_datetime64() if hasattr(brow["ts"], "to_datetime64") else np.datetime64(brow["ts"], "us")
+        diffs = np.abs(candle_times - bt)
+        ci = diffs.argmin()
+        min_diff_sec = diffs.min().astype("timedelta64[s]").astype(int)
+        if min_diff_sec > 300:
+            continue  # too far from any candle
+
+        for p_str, qty in brow.get("bids_bucketed", {}).items():
+            p = float(p_str)
+            bi = int((p - price_bins[0]) / price_bin)
+            if 0 <= bi < len(price_bins):
+                if np.isnan(bid_hm[ci, bi]):
+                    bid_hm[ci, bi] = 0
+                bid_hm[ci, bi] += float(qty)
+
+        for p_str, qty in brow.get("asks_bucketed", {}).items():
+            p = float(p_str)
+            bi = int((p - price_bins[0]) / price_bin)
+            if 0 <= bi < len(price_bins):
+                if np.isnan(ask_hm[ci, bi]):
+                    ask_hm[ci, bi] = 0
+                ask_hm[ci, bi] += float(qty)
+
+    return price_bins, bid_hm, ask_hm
+
+
 # ── Rendering ───────────────────────────────────────────────────────────────
 
 def _fmt(x):
@@ -220,6 +282,7 @@ def render_footprint_chart(
     candles: pd.DataFrame,
     footprint: pd.DataFrame,
     ob_data: dict | None,
+    book_heatmap: tuple | None = None,
     symbol: str = "BTCUSDT",
     title: str = "BTC Footprint + Orderbook",
     out_path: str | Path | None = None,
@@ -255,11 +318,11 @@ def render_footprint_chart(
     xlim_r = max(candle_right + margin, fp_right + 0.15)
 
     # ── Layout ──
-    fig = plt.figure(figsize=(20, 11), dpi=180)
+    fig = plt.figure(figsize=(12, 11), dpi=180)
     fig.patch.set_facecolor(BG)
 
     gs = fig.add_gridspec(
-        2, 2, height_ratios=[4, 1], width_ratios=[1, 0.22],
+        2, 2, height_ratios=[4, 1], width_ratios=[8, 1],
         hspace=0.05, wspace=0.02,
         left=0.03, right=0.97, bottom=0.07, top=0.95,
     )
@@ -280,6 +343,30 @@ def render_footprint_chart(
     for s in ax_main.spines.values():
         s.set_color(GRID)
         s.set_alpha(0.3)
+
+    # ├─ Orderbook heatmap background (per-candle) ──
+    if book_heatmap is not None:
+        price_bins_hm, bid_hm, ask_hm = book_heatmap
+        if bid_hm is not None and ask_hm is not None:
+            hm_bid_max = max(np.nanmax(bid_hm), 1.0)
+            hm_ask_max = max(np.nanmax(ask_hm), 1.0)
+            bid_norm = bid_hm.T / hm_bid_max
+            ask_norm = ask_hm.T / hm_ask_max
+
+            cmap_bid = LinearSegmentedColormap.from_list(
+                'bid_hm', [(0, 0, 0, 0), (0.15, 0.65, 0.15, 1)], N=256)
+            cmap_bid.set_bad(alpha=0)
+            cmap_ask = LinearSegmentedColormap.from_list(
+                'ask_hm', [(0, 0, 0, 0), (0.65, 0.15, 0.15, 1)], N=256)
+            cmap_ask.set_bad(alpha=0)
+
+            X, Y = np.meshgrid(np.arange(n) - 0.5, price_bins_hm)
+            ax_main.pcolormesh(X, Y, bid_norm, cmap=cmap_bid,
+                               alpha=1.0, shading='auto', zorder=0,
+                               linewidth=0, edgecolor='none')
+            ax_main.pcolormesh(X, Y, ask_norm, cmap=cmap_ask,
+                               alpha=1.0, shading='auto', zorder=0,
+                               linewidth=0, edgecolor='none')
 
     # ── Candles ──
     for i in range(n):
@@ -333,25 +420,27 @@ def render_footprint_chart(
                 y0 = pb - DEFAULT_PRICE_BIN / 2
                 y1 = pb + DEFAULT_PRICE_BIN / 2
 
-                if buy_v >= sell_v:
-                    # Bid-dominant → green
-                    alpha = MIN_ALPHA + (MAX_ALPHA - MIN_ALPHA) * (buy_v / max_buy)
-                    alpha = float(np.clip(alpha, MIN_ALPHA, MAX_ALPHA))
+                eq_v = min(buy_v, sell_v)
+                delta_v = abs(buy_v - sell_v)
+                eq_w = usable_w * (eq_v / total_v) if total_v > 0 else 0
+                delta_w = usable_w * (delta_v / total_v) if total_v > 0 else 0
+                dc = DELTA_BID if buy_v >= sell_v else DELTA_ASK
+
+                # Equilibrium portion (neutral)
+                if eq_w > 1e-8:
                     ax_main.fill_betweenx(
                         [y0, y1],
                         [right_origin, right_origin],
-                        [right_origin + usable_w, right_origin + usable_w],
-                        color=BID_GREEN, alpha=alpha, linewidth=0, edgecolor="none",
+                        [right_origin + eq_w, right_origin + eq_w],
+                        color=MUTED, alpha=0.45, linewidth=0, edgecolor="none",
                     )
-                else:
-                    # Ask-dominant → red
-                    alpha = MIN_ALPHA + (MAX_ALPHA - MIN_ALPHA) * (sell_v / max_sell)
-                    alpha = float(np.clip(alpha, MIN_ALPHA, MAX_ALPHA))
+                # Delta portion (bid=green / ask=red)
+                if delta_w > 1e-8:
                     ax_main.fill_betweenx(
                         [y0, y1],
-                        [right_origin, right_origin],
-                        [right_origin + usable_w, right_origin + usable_w],
-                        color=ASK_RED, alpha=alpha, linewidth=0, edgecolor="none",
+                        [right_origin + eq_w, right_origin + eq_w],
+                        [right_origin + eq_w + delta_w, right_origin + eq_w + delta_w],
+                        color=dc, alpha=0.75, linewidth=0, edgecolor="none",
                     )
 
     # ── Time labels above candles ──
@@ -441,10 +530,15 @@ def render_footprint_chart(
             if match.empty:
                 continue
             ci = match.index[0]
-            v = row["buy"] + row["sell"]
-            dc = BID_GREEN if row["buy"] >= row["sell"] else ASK_RED
-            ax_vol.bar(ci, v, width=CANDLE_WIDTH * 0.5,
-                       color=dc, alpha=0.35, linewidth=0)
+            buy = row["buy"]
+            sell = row["sell"]
+            eq = min(buy, sell)
+            delta = abs(buy - sell)
+            dc = BID_GREEN if buy >= sell else ASK_RED
+            ax_vol.bar(ci, eq, width=CANDLE_WIDTH * 2.0,
+                       color=MUTED, alpha=0.50, linewidth=0)
+            ax_vol.bar(ci, delta, bottom=eq, width=CANDLE_WIDTH * 2.0,
+                       color=dc, alpha=0.50, linewidth=0)
 
     # X-axis time labels (shared via twinx)
     step = max(1, n // 6)
@@ -565,6 +659,7 @@ def main():
 
     print("Loading orderbook...")
     ob_data = None
+    book_heatmap = None
     if book_path.exists():
         books = load_book_bucketed(book_path)
         if not books.empty:
@@ -573,12 +668,25 @@ def main():
                 print(f"  OB snapshot at {ob_data['ts']}, {len(ob_data['bids'])} bids, {len(ob_data['asks'])} asks")
             else:
                 print("  no OB snapshot in window")
+            # Build per-candle heatmap
+            if not candles.empty:
+                price_lo = candles["low"].min()
+                price_hi = candles["high"].max()
+                pad = (price_hi - price_lo) * 0.05
+                book_heatmap = build_ob_heatmap(
+                    books, candles,
+                    price_lo - pad, price_hi + pad,
+                    args.price_bin,
+                )
+                if book_heatmap[0] is not None:
+                    print(f"  OB heatmap: {book_heatmap[0].shape[0]} price bins x {len(candles)} candles")
     else:
         print("  book file not found")
 
     print("Rendering chart...")
     render_footprint_chart(
         candles, footprint, ob_data,
+        book_heatmap=book_heatmap,
         symbol=args.symbol,
         title=args.title,
         out_path=args.out,
