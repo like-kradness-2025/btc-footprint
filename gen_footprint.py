@@ -57,8 +57,9 @@ DEFAULT_HOURS = 3             # data window
 DEFAULT_TARGET_INTERVAL = 15  # minutes
 DEFAULT_CANDLES = 12          # display count
 CANDLE_WIDTH = 0.19
+CANDLE_X_OFFSET = -0.3       # left-align candle within heatmap cell
 GAP = 0.05
-FP_WIDTH = 0.75               # max footprint bar width in index units
+FP_WIDTH = 1.0                # max footprint bar width in index units
 MIN_ALPHA = 0.08
 MAX_ALPHA = 1.0
 
@@ -286,9 +287,9 @@ def build_ob_heatmap(
     bucket_times = candles["ts"].values.astype("datetime64[us]")
     n_buckets = n_candles
 
-    # Fractional x position — one bucket per candle
-    x_left = -CANDLE_WIDTH / 2
-    x_right = n_candles - 1 + CANDLE_WIDTH / 2
+    # Fractional x position — one cell per candle, centered at integer indices
+    x_left = -0.5
+    x_right = n_candles - 0.5
     x_positions = np.linspace(x_left, x_right, n_candles + 1)
 
     price_bins = np.arange(
@@ -391,13 +392,13 @@ def render_footprint_chart(
     price_lo = price_min - pad
     price_hi = price_max + pad
 
-    # X-axis extents
-    candle_left = -CANDLE_WIDTH / 2
-    candle_right = (n - 1) + CANDLE_WIDTH / 2
+    # X-axis extents (heatmap cells span -0.5 to n-0.5)
+    cell_left = -0.5
+    cell_right = (n - 1) + 0.5
     margin = 0.5
-    xlim_l = candle_left - margin
-    fp_right = (n - 1) + CANDLE_WIDTH / 2 + GAP + FP_WIDTH
-    xlim_r = max(candle_right + margin, fp_right + 0.15)
+    xlim_l = cell_left - margin
+    fp_right = (n - 1) + CANDLE_X_OFFSET + CANDLE_WIDTH / 2 + GAP + FP_WIDTH
+    xlim_r = max(cell_right + margin, fp_right + 0.15)
 
     # ── Layout ──
     fig = plt.figure(figsize=(12, 11), dpi=180)
@@ -476,8 +477,9 @@ def render_footprint_chart(
         row = candles.iloc[i]
         o, h, l, c = row["open"], row["high"], row["low"], row["close"]
         color = UP if c >= o else DOWN
-        ax_main.vlines(i, l, h, color=color, linewidth=1.0, alpha=0.85, zorder=5)
-        ax_main.bar(i, abs(c - o), CANDLE_WIDTH, bottom=min(o, c),
+        xi = i + CANDLE_X_OFFSET
+        ax_main.vlines(xi, l, h, color=color, linewidth=1.0, alpha=0.85, zorder=5)
+        ax_main.bar(xi, abs(c - o), CANDLE_WIDTH, bottom=min(o, c),
                     color=color, alpha=0.85, linewidth=0.4, edgecolor=color, zorder=5)
 
     # ── Footprint heatmap (bid=green / ask=red) ──
@@ -514,7 +516,7 @@ def render_footprint_chart(
                 ci = match.index[0]
 
                 # Bar geometry
-                right_origin = ci + CANDLE_WIDTH / 2 + GAP
+                right_origin = ci + CANDLE_X_OFFSET + CANDLE_WIDTH / 2 + GAP
                 usable_w = FP_WIDTH * (total_v / global_max)
 
                 if usable_w <= 1e-8:
@@ -551,7 +553,7 @@ def render_footprint_chart(
         t = candles.iloc[i]["ts"]
         if JST and hasattr(t, "tz_convert"):
             t = t.tz_convert(JST)
-        ax_main.text(i, price_hi + (price_hi - price_lo) * 0.02,
+        ax_main.text(i + CANDLE_X_OFFSET, price_hi + (price_hi - price_lo) * 0.02,
                      t.strftime("%H:%M"), color=MUTED, fontsize=9,
                      ha="center", va="bottom", alpha=0.85)
 
@@ -636,14 +638,15 @@ def render_footprint_chart(
             if match.empty:
                 continue
             ci = match.index[0]
+            bx = ci + CANDLE_X_OFFSET
             buy = row["buy"]
             sell = row["sell"]
             eq = min(buy, sell)
             delta = abs(buy - sell)
             dc = BID_GREEN if buy >= sell else ASK_RED
-            ax_vol.bar(ci, eq, width=CANDLE_WIDTH * 2.0,
+            ax_vol.bar(bx, eq, width=CANDLE_WIDTH * 2.0,
                        color=MUTED, alpha=0.50, linewidth=0)
-            ax_vol.bar(ci, delta, bottom=eq, width=CANDLE_WIDTH * 2.0,
+            ax_vol.bar(bx, delta, bottom=eq, width=CANDLE_WIDTH * 2.0,
                        color=dc, alpha=0.50, linewidth=0)
 
     # X-axis time labels (shared via twinx)
@@ -654,13 +657,13 @@ def render_footprint_chart(
         t = candles.iloc[i]["ts"]
         if JST and hasattr(t, "tz_convert"):
             t = t.tz_convert(JST)
-        tick_positions.append(i)
+        tick_positions.append(i + CANDLE_X_OFFSET)
         tick_labels.append(t.strftime("%H:%M"))
     if (n - 1) not in tick_positions:
         t = candles.iloc[-1]["ts"]
         if JST and hasattr(t, "tz_convert"):
             t = t.tz_convert(JST)
-        tick_positions.append(n - 1)
+        tick_positions.append((n - 1) + CANDLE_X_OFFSET)
         tick_labels.append(t.strftime("%H:%M"))
 
     ax_twin = ax_vol.twiny()
