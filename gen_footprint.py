@@ -72,15 +72,19 @@ except ImportError:
 
 # ── Data loading ────────────────────────────────────────────────────────────
 
-def _load_jsonl_tail(path: Path, hours: float) -> pd.DataFrame:
-    """Load only the last N hours from a JSONL file (read from end efficiently)."""
+def _load_jsonl_tail(path: Path, hours: float, byte_count: int = 100 * 1024 * 1024) -> pd.DataFrame:
+    """Load only the last N hours from a JSONL file (read from end efficiently).
+
+    Args:
+        path: Path to JSONL file.
+        hours: How many hours of data to keep (time filter).
+        byte_count: Bytes to read from end of file (default 100MB). Reduce for
+                    large raw files to speed up loading.
+    """
     import subprocess
-    # Find approximate byte position for N hours of data - read last 100MB
-    # The receiver generates ~1-2MB/min, so 100MB covers ~50-100min
-    byte_count = 100 * 1024 * 1024
     result = subprocess.run(
         ["tail", "-c", str(byte_count), str(path)],
-        capture_output=True, timeout=30
+        capture_output=True, timeout=120
     )
     lines = result.stdout.decode("utf-8", errors="replace").splitlines()
     # First line may be truncated; skip it if we're not at file start
@@ -100,7 +104,7 @@ def _load_jsonl_tail(path: Path, hours: float) -> pd.DataFrame:
         ts_str = d.get("ts") or d.get("timestamp")
         if ts_str is None:
             continue
-        ts = pd.to_datetime(ts_str)
+        ts = pd.to_datetime(ts_str, utc=True)
         if ts >= cutoff:
             d["_ts_parsed"] = ts  # store parsed timestamp for later conversion
             rows.append(d)
@@ -115,25 +119,25 @@ def _load_jsonl_tail(path: Path, hours: float) -> pd.DataFrame:
     return df
 
 
-def load_trades_compact(path: Path) -> pd.DataFrame:
-    return _load_jsonl_tail(path, DEFAULT_HOURS)
+def load_trades(path: Path, hours: int = DEFAULT_HOURS, byte_count: int = 100 * 1024 * 1024) -> pd.DataFrame:
+    return _load_jsonl_tail(path, hours, byte_count)
 
 
-def load_book_bucketed(path: Path) -> pd.DataFrame:
-    df = _load_jsonl_tail(path, DEFAULT_HOURS)
+def load_book_bucketed(path: Path, hours: int = DEFAULT_HOURS, byte_count: int = 100 * 1024 * 1024) -> pd.DataFrame:
+    df = _load_jsonl_tail(path, hours, byte_count)
     if df.empty:
         return df
-    # Book file may have array-typed rows; skip those
-    # (they become object dtype columns - we only want dict rows)
-    # Check if any column is entirely objects (likely from arrays mixing in)
-    for col in df.columns:
-        if df[col].dtype == object and df[col].apply(lambda x: isinstance(x, list)).any():
-            df = df[~df[col].apply(lambda x: isinstance(x, list))]
+    # Skip rows where bids_bucketed or asks_bucketed contain lists (corrupted)
+    for col in ["bids_bucketed", "asks_bucketed"]:
+        if col in df.columns and df[col].dtype == object:
+            mask = df[col].apply(lambda x: isinstance(x, list))
+            if mask.any():
+                df = df[~mask]
     return df
 
 
-def load_features(path: Path) -> pd.DataFrame:
-    df = _load_jsonl_tail(path, DEFAULT_HOURS)
+def load_features(path: Path, hours: int = DEFAULT_HOURS) -> pd.DataFrame:
+    df = _load_jsonl_tail(path, hours)
     if df.empty:
         return df
     df["mid"] = pd.to_numeric(df["mid"], errors="coerce")
@@ -154,6 +158,25 @@ def build_candles(features: pd.DataFrame, interval_minutes: int) -> pd.DataFrame
     return candles
 
 
+def _rebucket_trades(
+    trades: pd.DataFrame,
+    price_bin: int,
+) -> pd.DataFrame:
+    """Rebucket raw trades to a given price bin size.
+
+    Raw trades (live_trades.jsonl) have 'price' (float).
+    Compact trades (live_trades_compact.jsonl) have 'price_bucket' (int, pre-bucketed).
+    This function creates a new 'price_bucket' at the desired resolution.
+    """
+    if "price" in trades.columns:
+        # Raw trades — bucket from exact price
+        trades = trades.copy()
+        trades["price_bucket"] = (trades["price"] // price_bin) * price_bin
+        trades["price_bucket"] = trades["price_bucket"].astype(int)
+    # else: already has price_bucket, leave as-is (user's data bin)
+    return trades
+
+
 def build_footprint(
     trades: pd.DataFrame,
     interval_minutes: int,
@@ -163,18 +186,23 @@ def build_footprint(
         return pd.DataFrame(), {}
 
     freq = f"{interval_minutes}min"
+    trades = _rebucket_trades(trades, price_bin)
     trades["interval"] = trades["ts"].dt.floor(freq)
 
+    qty_col = "qty" if "qty" in trades.columns else "qty_sum"
+    if qty_col not in trades.columns:
+        raise KeyError(f"Neither 'qty' nor 'qty_sum' column found in trades data (columns: {list(trades.columns)})")
+
     agg = (
-        trades.groupby(["interval", "price_bucket", "side"])["qty_sum"]
+        trades.groupby(["interval", "price_bucket", "side"])[qty_col]
         .sum()
-        .reset_index()
+        .reset_index(name=qty_col)
     )
 
     pivot = agg.pivot_table(
         index=["interval", "price_bucket"],
         columns="side",
-        values="qty_sum",
+        values=qty_col,
         aggfunc="sum",
     ).fillna(0)
 
@@ -250,17 +278,13 @@ def build_ob_heatmap(
         return None, None, None, None
 
     n_candles = len(candles)
-    start_ts = candles["ts"].iloc[0]
-    end_ts = candles["ts"].iloc[-1]
-
-    # Buckets at candle interval resolution
-    freq = f"{interval_minutes}min"
-    buckets = pd.date_range(start=start_ts, end=end_ts, freq=freq)
-    if len(buckets) < 2:
+    if n_candles < 1:
         return None, None, None, None
 
-    n_buckets = len(buckets)
-    bucket_times = buckets.values.astype("datetime64[us]")
+    # Align buckets directly to candle timestamps (avoids date_range mismatch)
+    freq_delta = pd.Timedelta(minutes=interval_minutes)
+    bucket_times = candles["ts"].values.astype("datetime64[us]")
+    n_buckets = n_candles
 
     # Fractional x position — one bucket per candle
     x_left = -CANDLE_WIDTH / 2
@@ -302,6 +326,22 @@ def build_ob_heatmap(
                     ask_hm[bi, pi] = 0
                 ask_hm[bi, pi] += float(qty)
 
+    # Mask out price bins within each candle's high-low range
+    for bi in range(n_buckets):
+        ts_candle = candles.iloc[bi]["ts"]
+        bucket_start = ts_candle - freq_delta / 2
+        bucket_end = ts_candle + freq_delta / 2
+        # Find all candles overlapping this bucket's time range
+        overlap = candles[
+            (candles["ts"] >= bucket_start) & (candles["ts"] < bucket_end)
+        ]
+        for _, candle in overlap.iterrows():
+            low = candle["low"]
+            high = candle["high"]
+            mask = (price_bins >= low) & (price_bins <= high)
+            bid_hm[bi, mask] = np.nan
+            ask_hm[bi, mask] = np.nan
+
     return x_positions, price_bins, bid_hm, ask_hm
 
 
@@ -325,6 +365,9 @@ def render_footprint_chart(
     out_path: str | Path | None = None,
     interval_label: str = "15m",
     display_candles: int = DEFAULT_CANDLES,
+    show_ob_heatmap: bool = True,
+    price_bin: int = DEFAULT_PRICE_BIN,
+    ob_price_bin: int = DEFAULT_PRICE_BIN,
 ) -> tuple[plt.Figure, plt.Axes]:
     """Render footprint chart with bid=green / ask=red heatmap.
 
@@ -384,7 +427,7 @@ def render_footprint_chart(
         s.set_alpha(0.3)
 
     # ├─ Orderbook heatmap background (per-candle) ──
-    if book_heatmap is not None:
+    if book_heatmap is not None and show_ob_heatmap:
         x_pos_hm, price_bins_hm, bid_hm, ask_hm = book_heatmap
         if bid_hm is not None and ask_hm is not None:
             hm_bid_max = max(np.nanmax(bid_hm), 1.0)
@@ -411,9 +454,14 @@ def render_footprint_chart(
             cmap_ask.set_bad(alpha=0)
 
             # Y edge positions for pcolormesh (n_bins + 1 edges)
+            # Calculate y-edges from actual bin centers (use min gap for robustness)
+            if len(price_bins_hm) > 1:
+                half_step = max(np.diff(price_bins_hm).min(), 1.0) / 2.0
+            else:
+                half_step = DEFAULT_PRICE_BIN / 2.0
             y_edges = np.append(
-                price_bins_hm - DEFAULT_PRICE_BIN / 2,
-                price_bins_hm[-1] + DEFAULT_PRICE_BIN / 2
+                price_bins_hm - half_step,
+                price_bins_hm[-1] + half_step
             )
             X, Y = np.meshgrid(x_pos_hm, y_edges)
             ax_main.pcolormesh(X, Y, bid_norm, cmap=cmap_bid,
@@ -472,8 +520,8 @@ def render_footprint_chart(
                 if usable_w <= 1e-8:
                     continue
 
-                y0 = pb - DEFAULT_PRICE_BIN / 2
-                y1 = pb + DEFAULT_PRICE_BIN / 2
+                y0 = pb - price_bin / 2
+                y1 = pb + price_bin / 2
 
                 eq_v = min(buy_v, sell_v)
                 delta_v = abs(buy_v - sell_v)
@@ -550,12 +598,12 @@ def render_footprint_chart(
         if bids:
             prices, qties = zip(*bids)
             ax_ob.barh(prices, [-4.0 * q / max_q for q in qties],
-                       height=DEFAULT_PRICE_BIN * 0.85,
+                       height=ob_price_bin * 0.85,
                        color=BID_GREEN, alpha=0.55, align="center", linewidth=0)
         if asks:
             prices, qties = zip(*asks)
             ax_ob.barh(prices, [4.0 * q / max_q for q in qties],
-                       height=DEFAULT_PRICE_BIN * 0.85,
+                       height=ob_price_bin * 0.85,
                        color=ASK_RED, alpha=0.55, align="center", linewidth=0)
         ax_ob.axvline(0, color=TEXT, linewidth=0.4, alpha=0.3)
         ax_ob.set_xlim(-4.5, 4.5)
@@ -630,7 +678,7 @@ def render_footprint_chart(
         start_t = start_t.tz_convert(JST)
         end_t = end_t.tz_convert(JST)
     fig.suptitle(
-        f"BTC {symbol} Footprint ({n} candles / ${DEFAULT_PRICE_BIN} bins)  "
+        f"{title}  ({n} candles / ${price_bin} bins)  "
         f"{start_t.strftime('%H:%M')} – {end_t.strftime('%H:%M')} JST  •  bid=green  ask=red",
         color=TEXT, fontsize=16, y=0.97,
     )
@@ -657,11 +705,15 @@ def main():
     parser.add_argument("--target-minutes", type=int, default=DEFAULT_TARGET_INTERVAL,
                         help="Candle interval in minutes (default: 15)")
     parser.add_argument("--price-bin", type=int, default=DEFAULT_PRICE_BIN,
-                        help="Price bucket size in USD (default: 10)")
+                        help="Price bucket size for footprint bars in USD (default: 10)")
+    parser.add_argument("--ob-price-bin", type=int, default=DEFAULT_PRICE_BIN,
+                        help="Price bucket size for orderbook heatmap in USD (default: 10)")
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--title", default="BTC Footprint + Orderbook")
     parser.add_argument("--candles", type=int, default=DEFAULT_CANDLES,
                         help="Number of candles to display (default: 12)")
+    parser.add_argument("--no-ob-heatmap", action="store_true",
+                        help="Disable orderbook depth heatmap background")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -672,13 +724,22 @@ def main():
     trades_path = data_dir / "live_trades_compact.jsonl"
     book_path = data_dir / "live_book_bucketed.jsonl"
     features_path = data_dir / "live_features_1s.jsonl"
+    raw_trades_path = data_dir / "live_trades.jsonl"
+
+    # Use raw trades for non-default price bin (rebucket at desired resolution)
+    use_raw = args.price_bin != DEFAULT_PRICE_BIN and raw_trades_path.exists()
+    if use_raw:
+        trades_path = raw_trades_path
 
     if not trades_path.exists():
         print(f"ERROR: trades file not found: {trades_path}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loading trades from {trades_path}...")
-    trades = load_trades_compact(trades_path)
+    # Reduce tail size for raw trades (large file → faster loading)
+    raw_tail_bytes = 50 * 1024 * 1024 if use_raw else 100 * 1024 * 1024
+
+    print(f"Loading trades from {trades_path}...{' (raw, rebucketing to $' + str(args.price_bin) + ')' if use_raw else ''}")
+    trades = load_trades(trades_path, args.hours, raw_tail_bytes)
     if trades.empty:
         print("ERROR: no trade data loaded", file=sys.stderr)
         sys.exit(1)
@@ -697,7 +758,7 @@ def main():
     has_features = features_path.exists()
     candles = pd.DataFrame()
     if has_features:
-        features = load_features(features_path)
+        features = load_features(features_path, args.hours)
         features = features[features["ts"] >= start_time]
         if not features.empty:
             candles = build_candles(features, args.target_minutes)
@@ -711,10 +772,10 @@ def main():
         ).reset_index()
         candles = pd.DataFrame()
         candles["ts"] = fp_agg["interval"]
-        candles["open"] = candles["ts"]
+        candles["open"] = fp_agg["low"]
         candles["high"] = fp_agg["high"]
         candles["low"] = fp_agg["low"]
-        candles["close"] = candles["ts"]
+        candles["close"] = fp_agg["high"]
         print(f"  {len(candles)} candles from trade fallback")
 
     # Limit to display count BEFORE building OB heatmap
@@ -725,7 +786,7 @@ def main():
     ob_data = None
     book_heatmap = None
     if book_path.exists():
-        books = load_book_bucketed(book_path)
+        books = load_book_bucketed(book_path, args.hours)
         if not books.empty:
             ob_data = build_orderbook_depth(books, start_time, end_time)
             if ob_data:
@@ -740,7 +801,7 @@ def main():
                 book_heatmap = build_ob_heatmap(
                     books, candles,
                     price_lo - pad, price_hi + pad,
-                    args.price_bin,
+                    args.ob_price_bin,
                     interval_minutes=args.target_minutes,
                 )
                 if book_heatmap is not None and book_heatmap[1] is not None:
@@ -758,6 +819,9 @@ def main():
         out_path=args.out,
         interval_label=f"{args.target_minutes}m",
         display_candles=args.candles,
+        show_ob_heatmap=not args.no_ob_heatmap,
+        price_bin=args.price_bin,
+        ob_price_bin=args.ob_price_bin,
     )
     print("Done.")
 
