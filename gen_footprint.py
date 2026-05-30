@@ -233,14 +233,17 @@ def build_ob_heatmap(
     price_lo: float,
     price_hi: float,
     price_bin: float,
+    interval_minutes: int = 5,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """Build 1-minute resolution orderbook heatmap arrays for pcolormesh.
+    """Build orderbook heatmap arrays for pcolormesh at candle interval resolution.
+
+    Each bucket = one candle interval. Book depth data within each interval is summed.
 
     Returns (x_positions, price_bins, bid_heatmap, ask_heatmap) where:
-      - x_positions: 1D array of x-edge positions (n_min_buckets + 1) for pcolormesh
+      - x_positions: 1D array of x-edge positions (n_buckets + 1) for pcolormesh
       - price_bins: 1D array of price bin centers
-      - bid_heatmap: (n_min_buckets, n_bins) array of normalized bid depth [0..1]
-      - ask_heatmap: (n_min_buckets, n_bins) array of normalized ask depth [0..1]
+      - bid_heatmap: (n_buckets, n_bins) array of normalized bid depth [0..1]
+      - ask_heatmap: (n_buckets, n_bins) array of normalized ask depth [0..1]
     Returns all None on failure.
     """
     if book_df.empty or candles.empty:
@@ -250,18 +253,19 @@ def build_ob_heatmap(
     start_ts = candles["ts"].iloc[0]
     end_ts = candles["ts"].iloc[-1]
 
-    # 1-minute buckets
-    one_min = pd.Timedelta(minutes=1)
-    buckets = pd.date_range(start=start_ts, end=end_ts, freq="1min")
+    # Buckets at candle interval resolution
+    freq = f"{interval_minutes}min"
+    buckets = pd.date_range(start=start_ts, end=end_ts, freq=freq)
     if len(buckets) < 2:
         return None, None, None, None
 
     n_buckets = len(buckets)
     bucket_times = buckets.values.astype("datetime64[us]")
 
-    # Fractional x position for each bucket (linear map 0..n_candles-1)
-    total_sec = (end_ts - start_ts).total_seconds()
-    x_positions = np.linspace(-0.5, n_candles - 1 + 0.5, n_buckets + 1)
+    # Fractional x position — one bucket per candle
+    x_left = -CANDLE_WIDTH / 2
+    x_right = n_candles - 1 + CANDLE_WIDTH / 2
+    x_positions = np.linspace(x_left, x_right, n_candles + 1)
 
     price_bins = np.arange(
         (price_lo // price_bin) * price_bin,
@@ -372,7 +376,7 @@ def render_footprint_chart(
     ax_main.set_xticks([])
     ax_main.yaxis.tick_right()
     ax_main.yaxis.set_label_position("right")
-    ax_main.tick_params(axis="y", colors=TEXT, labelsize=7)
+    ax_main.tick_params(axis="y", colors=TEXT, labelsize=10)
     ax_main.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:,.0f}"))
     ax_main.grid(True, axis="both", linestyle=":", alpha=0.10, color=GRID)
     for s in ax_main.spines.values():
@@ -500,7 +504,7 @@ def render_footprint_chart(
         if JST and hasattr(t, "tz_convert"):
             t = t.tz_convert(JST)
         ax_main.text(i, price_hi + (price_hi - price_lo) * 0.02,
-                     t.strftime("%H:%M"), color=MUTED, fontsize=6.5,
+                     t.strftime("%H:%M"), color=MUTED, fontsize=9,
                      ha="center", va="bottom", alpha=0.85)
 
     # ── Latest price badge ──
@@ -508,9 +512,12 @@ def render_footprint_chart(
     lp = last["close"]
     lc = UP if last["close"] >= last["open"] else DOWN
     ax_main.text(0.02, 0.97, f"{lp:,.0f}  {interval_label}", transform=ax_main.transAxes,
-                 fontsize=18, fontweight="bold", color=lc, va="top", ha="left",
+                 fontsize=24, fontweight="bold", color=lc, va="top", ha="left",
                  bbox=dict(boxstyle="round,pad=0.2", fc="black", ec=lc, lw=0.8, alpha=0.75),
                  zorder=6)
+
+    # ── Current price horizontal line ──
+    ax_main.axhline(y=lp, color=lc, linewidth=1.0, linestyle="--", alpha=0.7, zorder=4)
 
     # ── Legend ──
     from matplotlib.patches import Patch
@@ -519,7 +526,7 @@ def render_footprint_chart(
             Patch(color=BID_GREEN, alpha=0.8, label="Bid"),
             Patch(color=ASK_RED, alpha=0.8, label="Ask"),
         ],
-        fontsize=7, loc="upper right", framealpha=0.6, labelcolor=TEXT,
+        fontsize=10, loc="upper right", framealpha=0.6, labelcolor=TEXT,
         bbox_to_anchor=(0.99, 0.99),
     )
     leg.get_frame().set_facecolor("black")
@@ -529,9 +536,9 @@ def render_footprint_chart(
     for s in ax_ob.spines.values():
         s.set_color(GRID)
         s.set_alpha(0.3)
-    ax_ob.tick_params(colors=MUTED, labelsize=6)
+    ax_ob.tick_params(colors=MUTED, labelsize=9)
     ax_ob.set_xticks([])
-    ax_ob.set_title("Orderbook", color=TEXT, fontsize=8)
+    ax_ob.set_title("Orderbook", color=TEXT, fontsize=11)
     ax_ob.set_ylim(price_lo, price_hi)
 
     if ob_data and ob_data.get("bids"):
@@ -555,7 +562,7 @@ def render_footprint_chart(
 
         # Depth label
         ax_ob.text(0.5, 0.02, f"depth: {_fmt(max_q)}",
-                   transform=ax_ob.transAxes, color=MUTED, fontsize=7,
+                   transform=ax_ob.transAxes, color=MUTED, fontsize=10,
                    ha="center", va="bottom")
     else:
         ax_ob.set_xlim(-4.5, 4.5)
@@ -565,7 +572,7 @@ def render_footprint_chart(
     for s in ax_vol.spines.values():
         s.set_color(GRID)
         s.set_alpha(0.3)
-    ax_vol.tick_params(colors=MUTED, labelsize=6)
+    ax_vol.tick_params(colors=MUTED, labelsize=9)
     ax_vol.yaxis.tick_right()
     ax_vol.yaxis.set_label_position("right")
     ax_vol.yaxis.set_major_formatter(FuncFormatter(lambda y, _: _fmt(y)))
@@ -611,7 +618,7 @@ def render_footprint_chart(
     ax_twin = ax_vol.twiny()
     ax_twin.set_xlim(xlim_l, xlim_r)
     ax_twin.set_xticks(tick_positions)
-    ax_twin.set_xticklabels(tick_labels, color=TEXT, fontsize=6.5)
+    ax_twin.set_xticklabels(tick_labels, color=TEXT, fontsize=9)
     ax_twin.tick_params(length=2, pad=2)
     for s in ax_twin.spines.values():
         s.set_visible(False)
@@ -625,7 +632,7 @@ def render_footprint_chart(
     fig.suptitle(
         f"BTC {symbol} Footprint ({n} candles / ${DEFAULT_PRICE_BIN} bins)  "
         f"{start_t.strftime('%H:%M')} – {end_t.strftime('%H:%M')} JST  •  bid=green  ask=red",
-        color=TEXT, fontsize=12, y=0.97,
+        color=TEXT, fontsize=16, y=0.97,
     )
 
     # ── Save ──
@@ -734,10 +741,11 @@ def main():
                     books, candles,
                     price_lo - pad, price_hi + pad,
                     args.price_bin,
+                    interval_minutes=args.target_minutes,
                 )
                 if book_heatmap is not None and book_heatmap[1] is not None:
                     pb, n_buckets = book_heatmap[1].shape[0], book_heatmap[2].shape[0]
-                    print(f"  OB heatmap: {pb} price bins x {n_buckets} 1min buckets")
+                    print(f"  OB heatmap: {pb} price bins x {n_buckets} buckets ({args.target_minutes}min interval)")
     else:
         print("  book file not found")
 
