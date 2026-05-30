@@ -28,6 +28,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import cast
 
 import matplotlib.dates as mdates
 import matplotlib.gridspec as gridspec
@@ -71,6 +72,27 @@ except ImportError:
     pass
 
 
+def _to_ts(obj) -> pd.Timestamp:
+    """任意の時刻表現を UTC pd.Timestamp に統一する。"""
+    if isinstance(obj, pd.Timestamp):
+        if obj.tz is None:
+            return obj.tz_localize("UTC")
+        return obj.tz_convert("UTC")
+    if isinstance(obj, np.datetime64):
+        return pd.Timestamp(obj).tz_localize("UTC")
+    if isinstance(obj, str):
+        return pd.to_datetime(obj, utc=True)
+    ts = pd.Timestamp(obj)
+    if ts.tz is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def _to_dt64(obj) -> np.datetime64:
+    """任意の時刻表現を UTC np.datetime64[us] に統一する。"""
+    return np.datetime64(_to_ts(obj).to_pydatetime().replace(tzinfo=None), "us")
+
+
 # ── Data loading ────────────────────────────────────────────────────────────
 
 def _load_jsonl_tail(path: Path, hours: float, byte_count: int = 100 * 1024 * 1024) -> pd.DataFrame:
@@ -82,17 +104,21 @@ def _load_jsonl_tail(path: Path, hours: float, byte_count: int = 100 * 1024 * 10
         byte_count: Bytes to read from end of file (default 100MB). Reduce for
                     large raw files to speed up loading.
     """
+    path = Path(path)
     import subprocess
     result = subprocess.run(
         ["tail", "-c", str(byte_count), str(path)],
         capture_output=True, timeout=120
     )
+    if result.returncode != 0:
+        print(f"WARNING: tail command failed (rc={result.returncode}): {path.name}", file=sys.stderr)
+        return pd.DataFrame()
     lines = result.stdout.decode("utf-8", errors="replace").splitlines()
     # First line may be truncated; skip it if we're not at file start
     file_size = path.stat().st_size
     if file_size > byte_count:
         lines = lines[1:]  # skip truncated first line
-    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=hours)
+    cutoff = _to_ts("now") - pd.Timedelta(hours=hours)
     rows = []
     for line in lines:
         line = line.strip()
@@ -105,7 +131,7 @@ def _load_jsonl_tail(path: Path, hours: float, byte_count: int = 100 * 1024 * 10
         ts_str = d.get("ts") or d.get("timestamp")
         if ts_str is None:
             continue
-        ts = pd.to_datetime(ts_str, utc=True)
+        ts = _to_ts(ts_str)
         if ts >= cutoff:
             d["_ts_parsed"] = ts  # store parsed timestamp for later conversion
             rows.append(d)
@@ -116,18 +142,29 @@ def _load_jsonl_tail(path: Path, hours: float, byte_count: int = 100 * 1024 * 10
         df["ts"] = df["_ts_parsed"]
         df.drop(columns=["_ts_parsed"], inplace=True)
     else:
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        df["ts"] = df["ts"].apply(_to_ts)
     return df
 
 
 def load_trades(path: Path, hours: int = DEFAULT_HOURS, byte_count: int = 100 * 1024 * 1024) -> pd.DataFrame:
-    return _load_jsonl_tail(path, hours, byte_count)
+    df = _load_jsonl_tail(path, hours, byte_count)
+    if df.empty:
+        return df
+    required = {"ts", "price", "qty", "side"}
+    alt_required = {"ts", "price_bucket", "buy", "sell"}
+    if required.issubset(df.columns) or alt_required.issubset(df.columns):
+        return df
+    print(f"WARNING: trades data missing expected columns (cols={list(df.columns)}), returning empty", file=sys.stderr)
+    return pd.DataFrame()
 
 
 def load_book_bucketed(path: Path, hours: int = DEFAULT_HOURS, byte_count: int = 100 * 1024 * 1024) -> pd.DataFrame:
     df = _load_jsonl_tail(path, hours, byte_count)
     if df.empty:
         return df
+    if "mid" not in df.columns:
+        print(f"WARNING: book data missing 'mid' column (cols={list(df.columns)})", file=sys.stderr)
+        return pd.DataFrame()
     # Skip rows where bids_bucketed or asks_bucketed contain lists (corrupted)
     for col in ["bids_bucketed", "asks_bucketed"]:
         if col in df.columns and df[col].dtype == object:
@@ -141,8 +178,23 @@ def load_features(path: Path, hours: int = DEFAULT_HOURS) -> pd.DataFrame:
     df = _load_jsonl_tail(path, hours)
     if df.empty:
         return df
+    if "mid" not in df.columns:
+        print(f"WARNING: features data missing 'mid' column (cols={list(df.columns)})", file=sys.stderr)
+        return pd.DataFrame()
     df["mid"] = pd.to_numeric(df["mid"], errors="coerce")
     return df.dropna(subset=["mid"])
+
+
+def load_oi(path: Path, hours: int = DEFAULT_HOURS) -> pd.DataFrame:
+    """Load OI data from live_oi.jsonl."""
+    df = _load_jsonl_tail(path, hours)
+    if df.empty:
+        return df
+    if "oi" not in df.columns:
+        print(f"WARNING: OI data missing 'oi' column (cols={list(df.columns)})", file=sys.stderr)
+        return pd.DataFrame()
+    df["oi"] = pd.to_numeric(df["oi"], errors="coerce")
+    return df.dropna(subset=["oi"])
 
 
 # ── Processing ──────────────────────────────────────────────────────────────
@@ -284,13 +336,11 @@ def build_ob_heatmap(
 
     # Align buckets directly to candle timestamps (avoids date_range mismatch)
     freq_delta = pd.Timedelta(minutes=interval_minutes)
-    bucket_times = candles["ts"].values.astype("datetime64[us]")
+    bucket_times = np.array([_to_dt64(t) for t in candles["ts"]], dtype="datetime64[us]")
     n_buckets = n_candles
 
     # Fractional x position — one cell per candle, centered at integer indices
-    x_left = -0.5
-    x_right = n_candles - 0.5
-    x_positions = np.linspace(x_left, x_right, n_candles + 1)
+    x_positions = np.linspace(-0.5, n_candles - 0.5, n_candles + 1)
 
     price_bins = np.arange(
         (price_lo // price_bin) * price_bin,
@@ -303,47 +353,74 @@ def build_ob_heatmap(
     bid_hm = np.full((n_buckets, len(price_bins)), np.nan)
     ask_hm = np.full((n_buckets, len(price_bins)), np.nan)
 
-    for _, brow in book_df.iterrows():
-        bt = brow["ts"].to_datetime64() if hasattr(brow["ts"], "to_datetime64") else np.datetime64(brow["ts"], "us")
-        diffs = np.abs(bucket_times - bt)
-        bi = diffs.argmin()
-        min_diff_sec = diffs.min().astype("timedelta64[s]").astype(int)
-        if min_diff_sec > 300:
+    # Precompute candle bucket masks once
+    low_high_masks: list[np.ndarray] = []
+    for low, high in candles[["low", "high"]].itertuples(index=False, name=None):
+        low_high_masks.append((price_bins >= low) & (price_bins <= high))
+
+    # Map each book timestamp to nearest candle bucket in O(log n)
+    bucket_ns = bucket_times.astype("datetime64[ns]")
+    book_rows = book_df[["ts", "bids_bucketed", "asks_bucketed"]].itertuples(index=False)
+    for brow in book_rows:
+        bt = _to_dt64(brow.ts)
+        bt_ns = np.datetime64(bt, "ns")
+        bi = int(np.searchsorted(bucket_ns, bt_ns))
+        if bi <= 0:
+            nearest = 0
+        elif bi >= n_buckets:
+            nearest = n_buckets - 1
+        else:
+            left = bucket_ns[bi - 1]
+            right = bucket_ns[bi]
+            nearest = bi - 1 if (bt_ns - left) <= (right - bt_ns) else bi
+
+        min_diff_sec = int(abs((bt_ns - bucket_ns[nearest]) / np.timedelta64(1, "s")))
+        if min_diff_sec > interval_minutes * 60:
             continue  # too far from any bucket
 
-        for p_str, qty in brow.get("bids_bucketed", {}).items():
-            p = float(p_str)
-            pi = int((p - price_bins[0]) / price_bin)
-            if 0 <= pi < len(price_bins):
-                if np.isnan(bid_hm[bi, pi]):
-                    bid_hm[bi, pi] = 0
-                bid_hm[bi, pi] += float(qty)
+        bids_bucketed = cast(dict, brow.bids_bucketed) if brow.bids_bucketed is not None else {}
+        asks_bucketed = cast(dict, brow.asks_bucketed) if brow.asks_bucketed is not None else {}
 
-        for p_str, qty in brow.get("asks_bucketed", {}).items():
+        for p_str, qty in bids_bucketed.items():
             p = float(p_str)
             pi = int((p - price_bins[0]) / price_bin)
             if 0 <= pi < len(price_bins):
-                if np.isnan(ask_hm[bi, pi]):
-                    ask_hm[bi, pi] = 0
-                ask_hm[bi, pi] += float(qty)
+                if np.isnan(bid_hm[nearest, pi]):
+                    bid_hm[nearest, pi] = 0
+                bid_hm[nearest, pi] += float(qty)
+
+        for p_str, qty in asks_bucketed.items():
+            p = float(p_str)
+            pi = int((p - price_bins[0]) / price_bin)
+            if 0 <= pi < len(price_bins):
+                if np.isnan(ask_hm[nearest, pi]):
+                    ask_hm[nearest, pi] = 0
+                ask_hm[nearest, pi] += float(qty)
 
     # Mask out price bins within each candle's high-low range
-    for bi in range(n_buckets):
-        ts_candle = candles.iloc[bi]["ts"]
-        bucket_start = ts_candle - freq_delta / 2
-        bucket_end = ts_candle + freq_delta / 2
-        # Find all candles overlapping this bucket's time range
-        overlap = candles[
-            (candles["ts"] >= bucket_start) & (candles["ts"] < bucket_end)
-        ]
-        for _, candle in overlap.iterrows():
-            low = candle["low"]
-            high = candle["high"]
-            mask = (price_bins >= low) & (price_bins <= high)
+    for bi, mask in enumerate(low_high_masks):
+        if mask.any():
             bid_hm[bi, mask] = np.nan
             ask_hm[bi, mask] = np.nan
 
     return x_positions, price_bins, bid_hm, ask_hm
+
+
+def resample_oi_to_candles(oi_df: pd.DataFrame, candles: pd.DataFrame, interval_minutes: int) -> pd.Series | None:
+    """Resample OI to match candle timestamps. Returns Series indexed by candle index (0..n-1)."""
+    if oi_df.empty or candles.empty:
+        return None
+    freq = f"{interval_minutes}min"
+    oi = oi_df.copy()
+    oi["bucket"] = oi["ts"].dt.floor(freq)
+    last_oi = oi.groupby("bucket")["oi"].last().reset_index()
+    last_oi.rename(columns={"bucket": "ts"}, inplace=True)
+    merged = candles[["ts"]].merge(last_oi, on="ts", how="left")
+    if merged["oi"].isna().all():
+        print("WARNING: OI data could not be aligned to candle timestamps", file=sys.stderr)
+        return None
+    merged["oi"] = merged["oi"].ffill()
+    return merged["oi"]
 
 
 # ── Rendering ───────────────────────────────────────────────────────────────
@@ -369,6 +446,7 @@ def render_footprint_chart(
     show_ob_heatmap: bool = True,
     price_bin: int = DEFAULT_PRICE_BIN,
     ob_price_bin: int = DEFAULT_PRICE_BIN,
+    oi_data: pd.Series | None = None,
 ) -> tuple[plt.Figure, plt.Axes]:
     """Render footprint chart with bid=green / ask=red heatmap.
 
@@ -487,11 +565,9 @@ def render_footprint_chart(
     fp_plot = pd.DataFrame()
     if not footprint.empty:
         # Match footprint intervals to candles (normalize type)
-        candle_ts_set = set(candles["ts"].apply(
-            lambda t: pd.Timestamp(t).tz_localize("UTC") if t.tz is None else pd.Timestamp(t)
-        ))
+        candle_ts_set = set(candles["ts"].apply(_to_ts))
         fp_plot = footprint.copy()
-        fp_plot["_ts_match"] = fp_plot["interval"].apply(lambda t: pd.Timestamp(t))
+        fp_plot["_ts_match"] = fp_plot["interval"].apply(_to_ts)
         fp_plot = fp_plot[fp_plot["_ts_match"].isin(candle_ts_set)]
 
         if not fp_plot.empty:
@@ -648,6 +724,23 @@ def render_footprint_chart(
                        color=MUTED, alpha=0.50, linewidth=0)
             ax_vol.bar(bx, delta, bottom=eq, width=CANDLE_WIDTH * 2.0,
                        color=dc, alpha=0.50, linewidth=0)
+
+    # ── OI overlay on volume panel ──
+    if oi_data is not None and not oi_data.isna().all():
+        ax_oi = ax_vol.twinx()
+        oi_color = "#fbbf24"  # amber/yellow
+        oi_max = oi_data.max()
+        oi_norm = oi_data / oi_max if oi_max > 0 else oi_data
+        x_pos = np.arange(len(oi_data)) + CANDLE_X_OFFSET
+        ax_oi.plot(x_pos, np.asarray(oi_norm), color=oi_color, linewidth=1.2, alpha=0.8, zorder=5)
+        ax_oi.set_ylim(0, 1.05)
+        ax_oi.tick_params(colors=oi_color, labelsize=8)
+        ax_oi.set_ylabel("OI", color=oi_color, fontsize=9)
+        ax_oi.yaxis.set_label_position("left")
+        ax_oi.spines["left"].set_position(("outward", 40))
+        ax_oi.spines["left"].set_color(oi_color)
+        ax_oi.spines["left"].set_alpha(0.3)
+        ax_oi.spines["right"].set_visible(False)
 
     # X-axis time labels (shared via twinx)
     step = max(1, n // 6)
@@ -813,6 +906,21 @@ def main():
     else:
         print("  book file not found")
 
+    print("Loading OI data...")
+    oi_path = data_dir / "live_oi.jsonl"
+    oi_data = None
+    if oi_path.exists():
+        oi_df = load_oi(oi_path, args.hours)
+        if not oi_df.empty:
+            oi_df = oi_df[oi_df["ts"] >= start_time]
+            oi_data = resample_oi_to_candles(oi_df, candles, args.target_minutes)
+            if oi_data is not None:
+                print(f"  OI points: {len(oi_df)}, aligned to {len(oi_data)} candles")
+            else:
+                print("  OI aligned to 0 candles")
+    else:
+        print("  OI file not found")
+
     print("Rendering chart...")
     render_footprint_chart(
         candles, footprint, ob_data,
@@ -825,6 +933,7 @@ def main():
         show_ob_heatmap=not args.no_ob_heatmap,
         price_bin=args.price_bin,
         ob_price_bin=args.ob_price_bin,
+        oi_data=oi_data,
     )
     print("Done.")
 
