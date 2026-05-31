@@ -505,13 +505,19 @@ def render_footprint_chart(
     fig.patch.set_facecolor(BG)
 
     gs = fig.add_gridspec(
-        2, 2, height_ratios=[4, 1], width_ratios=[8, 1],
-        hspace=0.05, wspace=0.02,
-        left=0.03, right=0.90, bottom=0.07, top=0.95,
+        2, 1, height_ratios=[4, 1],
+        hspace=0.05,
+        left=0.03, right=0.86, bottom=0.07, top=0.95,
     )
     ax_main = fig.add_subplot(gs[0, 0])
-    ax_ob = fig.add_subplot(gs[0, 1])
     ax_vol = fig.add_subplot(gs[1, 0])
+
+    # Place Orderbook / Vol Profile as independent axes in the right margin,
+    # above the lower Vol/OI/CVD label area.
+    ob_y0, ob_y1 = 0.26, 0.95
+    ob_h = ob_y1 - ob_y0
+    ax_ob = fig.add_axes((0.865, ob_y0, 0.055, ob_h))
+    ax_vp = fig.add_axes((0.925, ob_y0, 0.055, ob_h))
 
     # ── Main chart axes ──
     ax_main.set_facecolor(NAVY)
@@ -712,6 +718,49 @@ def render_footprint_chart(
                    ha="center", va="bottom")
     else:
         ax_ob.set_xlim(-4.5, 4.5)
+
+    # ── Volume Profile panel (rightmost) ──
+    ax_vp.set_facecolor(NAVY)
+    for s in ax_vp.spines.values():
+        s.set_color(GRID)
+        s.set_alpha(0.3)
+    ax_vp.set_title("Vol Profile", color=TEXT, fontsize=10)
+    ax_vp.set_ylim(price_lo, price_hi)
+    ax_vp.tick_params(axis="y", left=False, labelleft=False, right=False, labelright=False, colors=MUTED, labelsize=8)
+    ax_vp.yaxis.set_ticks_position("none")
+    ax_vp.yaxis.set_label_position("right")
+    ax_vp.set_xticks([])
+
+    if not footprint.empty:
+        fp_vp = footprint[footprint["interval"].isin(candle_ts_to_idx)]
+        if not fp_vp.empty:
+            agg = fp_vp.groupby("price_bucket")[["buy", "sell"]].sum().reset_index()
+            agg = agg[(agg["price_bucket"] >= price_lo) & (agg["price_bucket"] <= price_hi)]
+            if not agg.empty:
+                max_total = max(agg["buy"].max(), agg["sell"].max(), 1.0)
+                for _, row in agg.iterrows():
+                    pb = row["price_bucket"]
+                    eq = min(row["buy"], row["sell"])
+                    delta = abs(row["buy"] - row["sell"])
+                    dc = BID_GREEN if row["buy"] >= row["sell"] else ASK_RED
+                    # equilibrium part (always present if both sides traded)
+                    if eq > 0:
+                        ax_vp.barh(pb, 4.0 * eq / max_total,
+                                   height=ob_price_bin * 0.85,
+                                   color=MUTED, alpha=0.40, align="center", linewidth=0)
+                    # delta part (stacked on top)
+                    if delta > 0:
+                        ax_vp.barh(pb, 4.0 * delta / max_total,
+                                   height=ob_price_bin * 0.85,
+                                   color=dc, alpha=0.55, align="center", linewidth=0)
+                ax_vp.axvline(0, color=TEXT, linewidth=0.4, alpha=0.3)
+                ax_vp.set_xlim(-4.5, 4.5)
+                ax_vp.text(0.5, 0.02, f"max: {_fmt(max_total)}",
+                           transform=ax_vp.transAxes, color=MUTED, fontsize=8,
+                           ha="center", va="bottom")
+                vp_has_data = True
+    if not locals().get("vp_has_data"):
+        ax_vp.set_xlim(-4.5, 4.5)
 
     # ── Volume ──
     ax_vol.set_facecolor(NAVY)
