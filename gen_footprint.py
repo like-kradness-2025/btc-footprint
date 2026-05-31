@@ -507,7 +507,7 @@ def render_footprint_chart(
     gs = fig.add_gridspec(
         2, 1, height_ratios=[4, 1],
         hspace=0.05,
-        left=0.03, right=0.86, bottom=0.07, top=0.95,
+        left=0.03, right=0.82, bottom=0.07, top=0.95,
     )
     ax_main = fig.add_subplot(gs[0, 0])
     ax_vol = fig.add_subplot(gs[1, 0])
@@ -516,8 +516,8 @@ def render_footprint_chart(
     # above the lower Vol/OI/CVD label area.
     ob_y0, ob_y1 = 0.26, 0.95
     ob_h = ob_y1 - ob_y0
-    ax_ob = fig.add_axes((0.865, ob_y0, 0.055, ob_h))
-    ax_vp = fig.add_axes((0.925, ob_y0, 0.055, ob_h))
+    ax_ob = fig.add_axes((0.826, ob_y0, 0.085, ob_h))
+    ax_vp = fig.add_axes((0.916, ob_y0, 0.079, ob_h))
 
     # ── Main chart axes ──
     ax_main.set_facecolor(NAVY)
@@ -724,7 +724,7 @@ def render_footprint_chart(
     for s in ax_vp.spines.values():
         s.set_color(GRID)
         s.set_alpha(0.3)
-    ax_vp.set_title("Vol Profile", color=TEXT, fontsize=10)
+    ax_vp.set_title("Vol Profile", color=TEXT, fontsize=9)
     ax_vp.set_ylim(price_lo, price_hi)
     ax_vp.tick_params(axis="y", left=False, labelleft=False, right=False, labelright=False, colors=MUTED, labelsize=8)
     ax_vp.yaxis.set_ticks_position("none")
@@ -862,7 +862,7 @@ def render_footprint_chart(
         ax_cvd.set_ylabel("CVD", color=cvd_color, fontsize=9, labelpad=8)
         ax_cvd.spines["left"].set_visible(False)
         ax_cvd.spines["right"].set_visible(True)
-        ax_cvd.spines["right"].set_position(("outward", 120))
+        ax_cvd.spines["right"].set_position(("outward", 110))
         ax_cvd.spines["right"].set_color(cvd_color)
         ax_cvd.spines["right"].set_alpha(0.45)
 

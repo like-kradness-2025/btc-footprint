@@ -116,8 +116,8 @@ flowchart TD
 | キャンドル | `ci + CANDLE_X_OFFSET(-0.3)` | 価格 (BTC/USD) | ci = 0..n-1 |
 | OB heatmap | `np.linspace(-0.5, n-0.5, n+1)` | 価格bins y_edges | pcolormesh cell-centered |
 | Footprint bar | `right_origin = ci + (-0.3) + 0.19/2 + GAP` | `pb ± price_bin/2` | 辞書参照O(1) |
-| OB panel | 正規化depth [-4.0, 4.0] | 価格 (mainと同一) | 右余白 `add_axes((0.865, 0.26, 0.055, 0.69))` |
-| Vol Profile panel | 正規化出来高 [0, 4.0] | 価格 (mainと同一) | 右余白 `add_axes((0.925, 0.26, 0.055, 0.69))`、Yラベル非表示 |
+| OB panel | 正規化depth [-4.0, 4.0] | 価格 (mainと同一) | 右余白 `add_axes((0.826, 0.26, 0.085, 0.69))` |
+| Vol Profile panel | 正規化出来高 [0, 4.0] | 価格 (mainと同一) | 右余白 `add_axes((0.916, 0.26, 0.079, 0.69))`、Yラベル非表示 |
 | Volume | `ci + CANDLE_X_OFFSET` | 出来高 | 辞書参照O(1) |
 | OI | `np.arange(n) + CANDLE_X_OFFSET` | OI値 (動的range) | twinx |
 | CVD | `np.arange(n) + CANDLE_X_OFFSET` | 累積 `buy-sell` | twinx (右側第3軸) |
