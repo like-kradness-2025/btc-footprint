@@ -95,7 +95,12 @@ def _to_dt64(obj) -> np.datetime64:
 
 # ── Data loading ────────────────────────────────────────────────────────────
 
-def _load_jsonl_tail(path: Path, hours: float, byte_count: int = 100 * 1024 * 1024) -> pd.DataFrame:
+def _load_jsonl_tail(
+    path: Path,
+    hours: float,
+    byte_count: int = 100 * 1024 * 1024,
+    cutoff: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     """Load only the last N hours from a JSONL file (read from end efficiently).
 
     Args:
@@ -118,7 +123,10 @@ def _load_jsonl_tail(path: Path, hours: float, byte_count: int = 100 * 1024 * 10
     file_size = path.stat().st_size
     if file_size > byte_count:
         lines = lines[1:]  # skip truncated first line
-    cutoff = _to_ts("now") - pd.Timedelta(hours=hours)
+    if cutoff is None:
+        cutoff = _to_ts("now") - pd.Timedelta(hours=hours)
+    else:
+        cutoff = _to_ts(cutoff)
     rows = []
     for line in lines:
         line = line.strip()
@@ -131,35 +139,41 @@ def _load_jsonl_tail(path: Path, hours: float, byte_count: int = 100 * 1024 * 10
         ts_str = d.get("ts") or d.get("timestamp")
         if ts_str is None:
             continue
-        ts = _to_ts(ts_str)
-        if ts >= cutoff:
-            d["_ts_parsed"] = ts  # store parsed timestamp for later conversion
-            rows.append(d)
+        d["ts"] = ts_str  # keep as string, vectorize later
+        rows.append(d)
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    if "_ts_parsed" in df.columns:
-        df["ts"] = df["_ts_parsed"]
-        df.drop(columns=["_ts_parsed"], inplace=True)
-    else:
-        df["ts"] = df["ts"].apply(_to_ts)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df = df[df["ts"] >= cutoff].reset_index(drop=True)
     return df
 
 
-def load_trades(path: Path, hours: int = DEFAULT_HOURS, byte_count: int = 100 * 1024 * 1024) -> pd.DataFrame:
-    df = _load_jsonl_tail(path, hours, byte_count)
+def load_trades(
+    path: Path,
+    hours: int = DEFAULT_HOURS,
+    byte_count: int = 100 * 1024 * 1024,
+    cutoff: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    df = _load_jsonl_tail(path, hours, byte_count, cutoff=cutoff)
     if df.empty:
         return df
     required = {"ts", "price", "qty", "side"}
     alt_required = {"ts", "price_bucket", "buy", "sell"}
-    if required.issubset(df.columns) or alt_required.issubset(df.columns):
+    compact_required = {"ts", "price_bucket", "qty_sum", "side"}
+    if required.issubset(df.columns) or alt_required.issubset(df.columns) or compact_required.issubset(df.columns):
         return df
     print(f"WARNING: trades data missing expected columns (cols={list(df.columns)}), returning empty", file=sys.stderr)
     return pd.DataFrame()
 
 
-def load_book_bucketed(path: Path, hours: int = DEFAULT_HOURS, byte_count: int = 100 * 1024 * 1024) -> pd.DataFrame:
-    df = _load_jsonl_tail(path, hours, byte_count)
+def load_book_bucketed(
+    path: Path,
+    hours: int = DEFAULT_HOURS,
+    byte_count: int = 100 * 1024 * 1024,
+    cutoff: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    df = _load_jsonl_tail(path, hours, byte_count, cutoff=cutoff)
     if df.empty:
         return df
     if "mid" not in df.columns:
@@ -174,8 +188,8 @@ def load_book_bucketed(path: Path, hours: int = DEFAULT_HOURS, byte_count: int =
     return df
 
 
-def load_features(path: Path, hours: int = DEFAULT_HOURS) -> pd.DataFrame:
-    df = _load_jsonl_tail(path, hours)
+def load_features(path: Path, hours: int = DEFAULT_HOURS, cutoff: pd.Timestamp | None = None) -> pd.DataFrame:
+    df = _load_jsonl_tail(path, hours, cutoff=cutoff)
     if df.empty:
         return df
     if "mid" not in df.columns:
@@ -185,9 +199,9 @@ def load_features(path: Path, hours: int = DEFAULT_HOURS) -> pd.DataFrame:
     return df.dropna(subset=["mid"])
 
 
-def load_oi(path: Path, hours: int = DEFAULT_HOURS) -> pd.DataFrame:
+def load_oi(path: Path, hours: int = DEFAULT_HOURS, cutoff: pd.Timestamp | None = None) -> pd.DataFrame:
     """Load OI data from live_oi.jsonl."""
-    df = _load_jsonl_tail(path, hours)
+    df = _load_jsonl_tail(path, hours, cutoff=cutoff)
     if df.empty:
         return df
     if "oi" not in df.columns:
@@ -240,6 +254,20 @@ def build_footprint(
 
     freq = f"{interval_minutes}min"
     trades = _rebucket_trades(trades, price_bin)
+
+    # 形式B (price_bucket, buy, sell) は side 列がないため、
+    # 先に melt して形式C相当 (price_bucket, qty_sum, side) に正規化する。
+    # これにより既存の groupby / pivot ロジックをそのまま再利用できる。
+    if "side" not in trades.columns and {"buy", "sell"}.issubset(trades.columns):
+        trades = trades.melt(
+            id_vars=[c for c in trades.columns if c not in {"buy", "sell"}],
+            value_vars=["buy", "sell"],
+            var_name="side",
+            value_name="qty_sum",
+        )
+        trades["qty_sum"] = pd.to_numeric(trades["qty_sum"], errors="coerce")
+        trades = trades.dropna(subset=["qty_sum"]).copy()
+
     trades["interval"] = trades["ts"].dt.floor(freq)
 
     qty_col = "qty" if "qty" in trades.columns else "qty_sum"
@@ -262,6 +290,7 @@ def build_footprint(
     for col in ["buy", "sell"]:
         if col not in pivot.columns:
             pivot[col] = 0.0
+    pivot[["buy", "sell"]] = pivot[["buy", "sell"]].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
     pivot["total"] = pivot["buy"] + pivot["sell"]
     pivot["delta"] = pivot["buy"] - pivot["sell"]
@@ -289,12 +318,13 @@ def build_orderbook_depth(
     if ts_max is not None:
         subset = subset[subset["ts"] <= ts_max]
     if subset.empty:
-        subset = book_df.tail(1)
-
-    latest = subset.sort_values("ts").iloc[-1]
-    mid = float(latest.get("mid", 0))
-    bids_raw = latest.get("bids_bucketed", {})
-    asks_raw = latest.get("asks_bucketed", {})
+        # Fallback: use the latest row by timestamp from the full dataset
+        latest_row = book_df.sort_values("ts").iloc[-1]
+    else:
+        latest_row = subset.sort_values("ts").iloc[-1]
+    mid = float(latest_row.get("mid", 0))
+    bids_raw = latest_row.get("bids_bucketed", {})
+    asks_raw = latest_row.get("asks_bucketed", {})
 
     bids = sorted(
         [(float(k), float(v)) for k, v in bids_raw.items() if float(v) > 0],
@@ -305,7 +335,7 @@ def build_orderbook_depth(
         key=lambda x: x[0],
     )[:max_levels]
 
-    return {"mid": mid, "bids": bids, "asks": asks, "ts": latest["ts"]}
+    return {"mid": mid, "bids": bids, "asks": asks, "ts": latest_row["ts"]}
 
 
 def build_ob_heatmap(
@@ -334,9 +364,11 @@ def build_ob_heatmap(
     if n_candles < 1:
         return None, None, None, None
 
-    # Align buckets directly to candle timestamps (avoids date_range mismatch)
-    freq_delta = pd.Timedelta(minutes=interval_minutes)
-    bucket_times = np.array([_to_dt64(t) for t in candles["ts"]], dtype="datetime64[us]")
+    # Align buckets directly to candle timestamps using floor-based assignment.
+    freq = f"{interval_minutes}min"
+    candle_ts_map = {ts: i for i, ts in enumerate(candles["ts"])}
+    book_times = pd.to_datetime(book_df["ts"], utc=True)
+    book_buckets = book_times.dt.floor(freq)
     n_buckets = n_candles
 
     # Fractional x position — one cell per candle, centered at integer indices
@@ -358,25 +390,13 @@ def build_ob_heatmap(
     for low, high in candles[["low", "high"]].itertuples(index=False, name=None):
         low_high_masks.append((price_bins >= low) & (price_bins <= high))
 
-    # Map each book timestamp to nearest candle bucket in O(log n)
-    bucket_ns = bucket_times.astype("datetime64[ns]")
+    # Map each book timestamp to its floor candle bucket.
     book_rows = book_df[["ts", "bids_bucketed", "asks_bucketed"]].itertuples(index=False)
-    for brow in book_rows:
-        bt = _to_dt64(brow.ts)
-        bt_ns = np.datetime64(bt, "ns")
-        bi = int(np.searchsorted(bucket_ns, bt_ns))
-        if bi <= 0:
-            nearest = 0
-        elif bi >= n_buckets:
-            nearest = n_buckets - 1
-        else:
-            left = bucket_ns[bi - 1]
-            right = bucket_ns[bi]
-            nearest = bi - 1 if (bt_ns - left) <= (right - bt_ns) else bi
-
-        min_diff_sec = int(abs((bt_ns - bucket_ns[nearest]) / np.timedelta64(1, "s")))
-        if min_diff_sec > interval_minutes * 60:
-            continue  # too far from any bucket
+    for row_idx, brow in enumerate(book_rows):
+        bucket_ts = book_buckets.iloc[row_idx]
+        nearest = candle_ts_map.get(bucket_ts)
+        if nearest is None:
+            continue
 
         bids_bucketed = cast(dict, brow.bids_bucketed) if brow.bids_bucketed is not None else {}
         asks_bucketed = cast(dict, brow.asks_bucketed) if brow.asks_bucketed is not None else {}
@@ -426,11 +446,13 @@ def resample_oi_to_candles(oi_df: pd.DataFrame, candles: pd.DataFrame, interval_
 # ── Rendering ───────────────────────────────────────────────────────────────
 
 def _fmt(x):
-    if abs(x) >= 1e6:
-        return f"{x / 1e6:.1f}M"
-    if abs(x) >= 1e3:
-        return f"{x / 1e3:.1f}k"
-    return f"{x:.1f}"
+    """Compact label for Volume axis: always in k units."""
+    return f"{x / 1e3:.1f}k"
+
+
+def _fmt_oi(x):
+    """Compact label for OI axis: k-value without suffix (104,400 → 104.4)."""
+    return f"{x / 1e3:.1f}"
 
 
 def render_footprint_chart(
@@ -485,7 +507,7 @@ def render_footprint_chart(
     gs = fig.add_gridspec(
         2, 2, height_ratios=[4, 1], width_ratios=[8, 1],
         hspace=0.05, wspace=0.02,
-        left=0.03, right=0.97, bottom=0.07, top=0.95,
+        left=0.03, right=0.90, bottom=0.07, top=0.95,
     )
     ax_main = fig.add_subplot(gs[0, 0])
     ax_ob = fig.add_subplot(gs[0, 1])
@@ -561,14 +583,13 @@ def render_footprint_chart(
                     color=color, alpha=0.85, linewidth=0.4, edgecolor=color, zorder=5)
 
     # ── Footprint heatmap (bid=green / ask=red) ──
-    candle_ts_set: set = set()
+    candle_ts_to_idx = {ts: idx for idx, ts in enumerate(candles["ts"])}
     fp_plot = pd.DataFrame()
     if not footprint.empty:
-        # Match footprint intervals to candles (normalize type)
-        candle_ts_set = set(candles["ts"].apply(_to_ts))
+        # Match footprint intervals to candles
         fp_plot = footprint.copy()
-        fp_plot["_ts_match"] = fp_plot["interval"].apply(_to_ts)
-        fp_plot = fp_plot[fp_plot["_ts_match"].isin(candle_ts_set)]
+        fp_plot["_ts_match"] = fp_plot["interval"]
+        fp_plot = fp_plot[fp_plot["_ts_match"].isin(candle_ts_to_idx)]
 
         if not fp_plot.empty:
             # Per-side max for alpha normalisation
@@ -586,10 +607,9 @@ def render_footprint_chart(
                     continue
 
                 # Find candle index
-                match = candles[candles["ts"] == intv]
-                if match.empty:
+                ci = candle_ts_to_idx.get(intv)
+                if ci is None:
                     continue
-                ci = match.index[0]
 
                 # Bar geometry
                 right_origin = ci + CANDLE_X_OFFSET + CANDLE_WIDTH / 2 + GAP
@@ -698,22 +718,32 @@ def render_footprint_chart(
     for s in ax_vol.spines.values():
         s.set_color(GRID)
         s.set_alpha(0.3)
-    ax_vol.tick_params(colors=MUTED, labelsize=9)
-    ax_vol.yaxis.tick_right()
+    # Right-side primary Y axis for volume.
+    # Keep this on the panel edge; the OI twin axis is offset further right.
+    ax_vol.tick_params(
+        axis="y", left=False, labelleft=False, right=True, labelright=True,
+        colors=MUTED, labelsize=9, pad=3,
+    )
+    ax_vol.yaxis.set_ticks_position("right")
     ax_vol.yaxis.set_label_position("right")
+    ax_vol.spines["left"].set_visible(False)
+    ax_vol.spines["right"].set_visible(True)
+    ax_vol.spines["right"].set_position(("outward", 0))
+    ax_vol.spines["right"].set_color(MUTED)
+    ax_vol.spines["right"].set_alpha(0.45)
+    ax_vol.set_ylabel("Vol", color=MUTED, fontsize=9, labelpad=6)
     ax_vol.yaxis.set_major_formatter(FuncFormatter(lambda y, _: _fmt(y)))
     ax_vol.grid(True, axis="y", linestyle=":", alpha=0.10, color=GRID)
     ax_vol.set_xlim(xlim_l, xlim_r)
     ax_vol.set_xticks([])
 
     if not footprint.empty:
-        vol_agg = footprint[footprint["interval"].isin(candle_ts_set)].copy()
+        vol_agg = footprint[footprint["interval"].isin(candle_ts_to_idx)].copy()
         vol_agg = vol_agg.groupby("interval")[["buy", "sell"]].sum().reset_index()
         for _, row in vol_agg.iterrows():
-            match = candles[candles["ts"] == row["interval"]]
-            if match.empty:
+            ci = candle_ts_to_idx.get(row["interval"])
+            if ci is None:
                 continue
-            ci = match.index[0]
             bx = ci + CANDLE_X_OFFSET
             buy = row["buy"]
             sell = row["sell"]
@@ -728,21 +758,80 @@ def render_footprint_chart(
     # ── OI overlay on volume panel ──
     if oi_data is not None and not oi_data.isna().all():
         ax_oi = ax_vol.twinx()
+        ax_oi.patch.set_visible(False)
         oi_color = "#fbbf24"  # amber/yellow
-        oi_max = oi_data.max()
-        oi_norm = oi_data / oi_max if oi_max > 0 else oi_data
+        oi_vals = np.asarray(oi_data)
+        oi_min, oi_max = oi_vals.min(), oi_vals.max()
+        oi_pad = (oi_max - oi_min) * 0.05 if oi_max > oi_min else oi_max * 0.05
         x_pos = np.arange(len(oi_data)) + CANDLE_X_OFFSET
-        ax_oi.plot(x_pos, np.asarray(oi_norm), color=oi_color, linewidth=1.2, alpha=0.8, zorder=5)
-        ax_oi.set_ylim(0, 1.05)
-        ax_oi.tick_params(colors=oi_color, labelsize=8)
-        ax_oi.set_ylabel("OI", color=oi_color, fontsize=9)
-        ax_oi.yaxis.set_label_position("left")
-        ax_oi.spines["left"].set_position(("outward", 40))
-        ax_oi.spines["left"].set_color(oi_color)
-        ax_oi.spines["left"].set_alpha(0.3)
-        ax_oi.spines["right"].set_visible(False)
+        ax_oi.plot(x_pos, oi_vals, color=oi_color, linewidth=1.2, alpha=0.8, zorder=5)
+        ax_oi.set_ylim(oi_min - oi_pad, oi_max + oi_pad)
+        ax_oi.tick_params(
+            axis="y", left=False, labelleft=False, right=True, labelright=True,
+            colors=oi_color, labelsize=8, pad=3,
+        )
+        ax_oi.yaxis.set_ticks_position("right")
+        ax_oi.yaxis.set_label_position("right")
+        ax_oi.yaxis.set_major_formatter(FuncFormatter(lambda y, _: _fmt_oi(y)))
+        ax_oi.set_ylabel("OI", color=oi_color, fontsize=9, labelpad=8)
+        ax_oi.spines["left"].set_visible(False)
+        ax_oi.spines["right"].set_visible(True)
+        ax_oi.spines["right"].set_position(("outward", 62))
+        ax_oi.spines["right"].set_color(oi_color)
+        ax_oi.spines["right"].set_alpha(0.45)
 
-    # X-axis time labels (shared via twinx)
+    # ── CVD overlay on volume panel ──
+    cvd_color = "#a78bfa"  # violet/purple
+    cvd_vals = None
+    if not footprint.empty:
+        cvd_agg = footprint[footprint["interval"].isin(candle_ts_to_idx)].copy()
+        cvd_agg = cvd_agg.groupby("interval")[["buy", "sell"]].sum()
+        cvd_agg["delta"] = cvd_agg["buy"] - cvd_agg["sell"]
+        # Align deltas to candle order, fill missing with 0, then cumsum
+        delta_by_ts = cvd_agg["delta"]
+        candle_ts_list = list(candles["ts"])
+        cvd_series = np.array(
+            [delta_by_ts.get(ts, 0.0) for ts in candle_ts_list],  # type: ignore[arg-type]
+            dtype=float,
+        )
+        cvd_vals = np.cumsum(cvd_series)
+    if cvd_vals is not None and cvd_vals.max() != cvd_vals.min():
+        ax_cvd = ax_vol.twinx()
+        ax_cvd.patch.set_visible(False)
+        x_pos = np.arange(n) + CANDLE_X_OFFSET
+        ax_cvd.plot(x_pos, cvd_vals, color=cvd_color, linewidth=1.4, alpha=0.85, zorder=6)
+        cvd_min, cvd_max = cvd_vals.min(), cvd_vals.max()
+        cvd_pad = (cvd_max - cvd_min) * 0.05
+        ax_cvd.set_ylim(cvd_min - cvd_pad, cvd_max + cvd_pad)
+        ax_cvd.tick_params(
+            axis="y", left=False, labelleft=False, right=True, labelright=True,
+            colors=cvd_color, labelsize=8, pad=3,
+        )
+        ax_cvd.yaxis.set_ticks_position("right")
+        ax_cvd.yaxis.set_label_position("right")
+        ax_cvd.yaxis.set_major_formatter(FuncFormatter(lambda y, _: _fmt(y)))
+        ax_cvd.set_ylabel("CVD", color=cvd_color, fontsize=9, labelpad=8)
+        ax_cvd.spines["left"].set_visible(False)
+        ax_cvd.spines["right"].set_visible(True)
+        ax_cvd.spines["right"].set_position(("outward", 120))
+        ax_cvd.spines["right"].set_color(cvd_color)
+        ax_cvd.spines["right"].set_alpha(0.45)
+
+    # twinx() moves the original axis back to the left in some matplotlib
+    # versions. Re-apply the Volume axis placement after the OI twin exists.
+    ax_vol.yaxis.tick_right()
+    ax_vol.yaxis.set_ticks_position("right")
+    ax_vol.yaxis.set_label_position("right")
+    ax_vol.tick_params(
+        axis="y", left=False, labelleft=False, right=True, labelright=True,
+        colors=MUTED, labelsize=9, pad=3,
+    )
+    ax_vol.spines["left"].set_visible(False)
+    ax_vol.spines["right"].set_visible(True)
+    ax_vol.spines["right"].set_position(("outward", 0))
+
+    # X-axis time labels. Use ax_vol directly instead of twiny() so no overlay
+    # axis can hide or confuse the Volume/OI right-side Y axes.
     step = max(1, n // 6)
     tick_positions = []
     tick_labels = []
@@ -759,13 +848,9 @@ def render_footprint_chart(
         tick_positions.append((n - 1) + CANDLE_X_OFFSET)
         tick_labels.append(t.strftime("%H:%M"))
 
-    ax_twin = ax_vol.twiny()
-    ax_twin.set_xlim(xlim_l, xlim_r)
-    ax_twin.set_xticks(tick_positions)
-    ax_twin.set_xticklabels(tick_labels, color=TEXT, fontsize=9)
-    ax_twin.tick_params(length=2, pad=2)
-    for s in ax_twin.spines.values():
-        s.set_visible(False)
+    ax_vol.set_xticks(tick_positions)
+    ax_vol.set_xticklabels(tick_labels, color=TEXT, fontsize=9)
+    ax_vol.tick_params(axis="x", length=2, pad=2, colors=TEXT)
 
     # ── Title ──
     start_t = candles.iloc[0]["ts"]
@@ -854,7 +939,7 @@ def main():
     has_features = features_path.exists()
     candles = pd.DataFrame()
     if has_features:
-        features = load_features(features_path, args.hours)
+        features = load_features(features_path, args.hours, cutoff=start_time)
         features = features[features["ts"] >= start_time]
         if not features.empty:
             candles = build_candles(features, args.target_minutes)
@@ -882,7 +967,7 @@ def main():
     ob_data = None
     book_heatmap = None
     if book_path.exists():
-        books = load_book_bucketed(book_path, args.hours)
+        books = load_book_bucketed(book_path, args.hours, cutoff=start_time)
         if not books.empty:
             ob_data = build_orderbook_depth(books, start_time, end_time)
             if ob_data:
@@ -910,7 +995,7 @@ def main():
     oi_path = data_dir / "live_oi.jsonl"
     oi_data = None
     if oi_path.exists():
-        oi_df = load_oi(oi_path, args.hours)
+        oi_df = load_oi(oi_path, args.hours, cutoff=start_time)
         if not oi_df.empty:
             oi_df = oi_df[oi_df["ts"] >= start_time]
             oi_data = resample_oi_to_candles(oi_df, candles, args.target_minutes)
