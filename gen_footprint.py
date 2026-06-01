@@ -58,6 +58,7 @@ DEFAULT_PRICE_BIN = 10        # USD
 DEFAULT_HOURS = 3             # data window
 DEFAULT_TARGET_INTERVAL = 15  # minutes
 DEFAULT_CANDLES = 12          # display count
+MIN_PRICE_AXIS_PAD = 100      # USD
 CANDLE_WIDTH = 0.19
 CANDLE_X_OFFSET = -0.3       # left-align candle within heatmap cell
 GAP = 0.05
@@ -92,6 +93,11 @@ def _to_ts(obj) -> pd.Timestamp:
 def _to_dt64(obj) -> np.datetime64:
     """任意の時刻表現を UTC np.datetime64[us] に統一する。"""
     return np.datetime64(_to_ts(obj).to_pydatetime().replace(tzinfo=None), "us")
+
+
+def _price_axis_padding(price_min: float, price_max: float) -> float:
+    """Shared visible-range padding for chart axes and OB heatmap alignment."""
+    return max(MIN_PRICE_AXIS_PAD, (price_max - price_min) * 0.12)
 
 
 # ── Data loading ────────────────────────────────────────────────────────────
@@ -571,7 +577,7 @@ def render_footprint_chart(
     # Price range
     price_min = candles["low"].min()
     price_max = candles["high"].max()
-    pad = max(50, (price_max - price_min) * 0.12)
+    pad = _price_axis_padding(price_min, price_max)
     price_lo = price_min - pad
     price_hi = price_max + pad
 
@@ -1137,7 +1143,7 @@ def main():
             if not candles.empty:
                 price_lo = candles["low"].min()
                 price_hi = candles["high"].max()
-                pad = max(50, (price_hi - price_lo) * 0.12)  # match render y-axis padding
+                pad = _price_axis_padding(price_lo, price_hi)  # match render y-axis padding
                 book_heatmap = build_ob_heatmap(
                     books, candles,
                     price_lo - pad, price_hi + pad,
