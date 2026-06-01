@@ -790,10 +790,20 @@ def render_footprint_chart(
     ax_ob.set_ylim(price_lo, price_hi)
 
     if ob_data and ob_data.get("bids"):
-        bids = [(p, q) for p, q in ob_data["bids"] if price_lo <= p <= price_hi]
-        asks = [(p, q) for p, q in ob_data["asks"] if price_lo <= p <= price_hi]
+        # The side depth panel is a latest-snapshot view, not a historical
+        # chart-range view. Use its own local price range so the top 40 OB
+        # levels do not collapse into one edge when older candles widen the
+        # main chart y-axis.
+        bids = list(ob_data["bids"])
+        asks = list(ob_data.get("asks", []))
         all_q = [q for _, q in bids] + [q for _, q in asks]
         max_q = max(all_q) if all_q else 1.0
+        ob_prices = [p for p, _ in bids] + [p for p, _ in asks]
+        if ob_prices:
+            ob_lo = min(ob_prices)
+            ob_hi = max(ob_prices)
+            ob_pad = max(ob_price_bin * 2, (ob_hi - ob_lo) * 0.10)
+            ax_ob.set_ylim(ob_lo - ob_pad, ob_hi + ob_pad)
 
         if bids:
             prices, qties = zip(*bids)
