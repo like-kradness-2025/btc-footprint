@@ -789,21 +789,51 @@ def render_footprint_chart(
     ax_ob.set_title("Orderbook", color=TEXT, fontsize=11)
     ax_ob.set_ylim(price_lo, price_hi)
 
-    if ob_data and ob_data.get("bids"):
-        # The side depth panel is a latest-snapshot view, not a historical
-        # chart-range view. Use its own local price range so the top 40 OB
-        # levels do not collapse into one edge when older candles widen the
-        # main chart y-axis.
-        bids = list(ob_data["bids"])
-        asks = list(ob_data.get("asks", []))
+    # Aggregate heatmap data across all displayed intervals
+    ob_rendered = False
+    if book_heatmap is not None:
+        _x_pos_hm, price_bins_hm, bid_hm, ask_hm = book_heatmap
+        if bid_hm is not None and ask_hm is not None:
+            agg_bid = np.nan_to_num(bid_hm).sum(axis=0)
+            agg_ask = np.nan_to_num(ask_hm).sum(axis=0)
+            max_q = max(agg_bid.max(), agg_ask.max(), 1.0)
+
+            # Bar height matching heatmap bin spacing
+            if len(price_bins_hm) > 1:
+                half_step = max(np.diff(price_bins_hm).min(), 1.0) / 2.0
+            else:
+                half_step = ob_price_bin / 2.0
+            bar_h = half_step * 2 * 0.85
+
+            # Bid (left) and Ask (right) bars at each price level
+            bid_mask = agg_bid > 0
+            ask_mask = agg_ask > 0
+            if bid_mask.any():
+                ax_ob.barh(price_bins_hm[bid_mask],
+                           -4.0 * agg_bid[bid_mask] / max_q,
+                           height=bar_h,
+                           color=BID_GREEN, alpha=0.55, align="center", linewidth=0)
+            if ask_mask.any():
+                ax_ob.barh(price_bins_hm[ask_mask],
+                           4.0 * agg_ask[ask_mask] / max_q,
+                           height=bar_h,
+                           color=ASK_RED, alpha=0.55, align="center", linewidth=0)
+            ax_ob.axvline(0, color=TEXT, linewidth=0.4, alpha=0.3)
+            ax_ob.set_xlim(-4.5, 4.5)
+
+            ax_ob.text(0.5, 0.02, f"depth: {_fmt(max_q)}",
+                       transform=ax_ob.transAxes, color=MUTED, fontsize=10,
+                       ha="center", va="bottom")
+            # Only mark rendered if there is actual data to show
+            if agg_bid.sum() + agg_ask.sum() > 0:
+                ob_rendered = True
+
+    if not ob_rendered and ob_data and ob_data.get("bids"):
+        # Fallback: latest snapshot (no heatmap available)
+        bids = [(p, q) for p, q in ob_data["bids"] if price_lo <= p <= price_hi]
+        asks = [(p, q) for p, q in ob_data["asks"] if price_lo <= p <= price_hi]
         all_q = [q for _, q in bids] + [q for _, q in asks]
         max_q = max(all_q) if all_q else 1.0
-        ob_prices = [p for p, _ in bids] + [p for p, _ in asks]
-        if ob_prices:
-            ob_lo = min(ob_prices)
-            ob_hi = max(ob_prices)
-            ob_pad = max(ob_price_bin * 2, (ob_hi - ob_lo) * 0.10)
-            ax_ob.set_ylim(ob_lo - ob_pad, ob_hi + ob_pad)
 
         if bids:
             prices, qties = zip(*bids)
@@ -818,7 +848,6 @@ def render_footprint_chart(
         ax_ob.axvline(0, color=TEXT, linewidth=0.4, alpha=0.3)
         ax_ob.set_xlim(-4.5, 4.5)
 
-        # Depth label
         ax_ob.text(0.5, 0.02, f"depth: {_fmt(max_q)}",
                    transform=ax_ob.transAxes, color=MUTED, fontsize=10,
                    ha="center", va="bottom")
