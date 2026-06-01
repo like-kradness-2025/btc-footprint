@@ -38,7 +38,7 @@ flowchart TD
         P1["build_footprint()<br/>→ _rebucket_trades()<br/>→ floor interval<br/>→ pivot buy/sell/total/delta<br/>※ 形式Bはmelt後に同一ロジック"]
         P2["build_candles()<br/>→ floor freq → groupBy agg OHLC"]
         P3["build_orderbook_depth()<br/>→ sort_values(ts).iloc[-1]<br/>→ sorted bids/asks"]
-        P4["build_ob_heatmap()<br/>→ dt.floor(freq) + candle_ts_map 辞書参照<br/>→ sum depth per candle bin<br/>→ mask high-low range"]
+        P4["build_ob_heatmap()<br/>→ dt.floor(freq) + candle_ts_map 辞書参照<br/>→ last snapshot per candle bin<br/>→ bid<=mid / ask>=mid sanity filter"]
         P5["resample_oi_to_candles()<br/>→ floor interval → groupBy last<br/>→ merge + ffill"]
     end
 
@@ -105,7 +105,7 @@ flowchart TD
 | `_rebucket_trades` | trades: `ts, price, side` or `price_bucket` | trades: `+price_bucket` | — |
 | `build_footprint` | trades: `ts, price_bucket, side, qty/qty_sum` | pivot: `interval, price_bucket, buy, sell, total, delta` | `interval` (= ts floor) |
 | `build_orderbook_depth` | book_df: `ts, mid, bids_bucketed, asks_bucketed` | dict: `{mid, bids[(p,q)], asks[(p,q)], ts}` | sort_values(ts).iloc[-1] |
-| `build_ob_heatmap` | book_df, candles, price_lo/hi, price_bin | `(x_positions, price_bins, bid_hm, ask_hm)` | dt.floor(freq) → candle_ts_map 辞書参照 |
+| `build_ob_heatmap` | book_df, candles, price_lo/hi, price_bin | `(x_positions, price_bins, bid_hm, ask_hm)` | dt.floor(freq) → candle_ts_map → 各足last snapshot |
 | `resample_oi_to_candles` | oi_df, candles, interval_minutes | Series (oi per candle 0..n-1) | `ts` merge left |
 | `render_footprint_chart` | candles, footprint, ob_data, book_heatmap, ... | (Figure, Axes) → PNG | candle_ts_to_idx 辞書 |
 

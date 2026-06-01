@@ -50,6 +50,7 @@ DELTA_BID = "#38bdf8"  # light blue for delta-bid
 DELTA_ASK = "#f97316"  # orange for delta-ask
 UP = "#4ade80"
 DOWN = "#f43f5e"
+CANDLE_UP = "#38bdf8"
 SPINE = "#3a5a7a"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
@@ -348,7 +349,8 @@ def build_ob_heatmap(
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Build orderbook heatmap arrays for pcolormesh at candle interval resolution.
 
-    Each bucket = one candle interval. Book depth data within each interval is summed.
+    Each bucket = one candle interval. Book depth data is represented by the last
+    snapshot within each candle bucket, not by summing snapshots inside the bucket.
 
     Returns (x_positions, price_bins, bid_heatmap, ask_heatmap) where:
       - x_positions: 1D array of x-edge positions (n_buckets + 1) for pcolormesh
@@ -367,8 +369,10 @@ def build_ob_heatmap(
     # Align buckets directly to candle timestamps using floor-based assignment.
     freq = f"{interval_minutes}min"
     candle_ts_map = {ts: i for i, ts in enumerate(candles["ts"])}
-    book_times = pd.to_datetime(book_df["ts"], utc=True)
-    book_buckets = book_times.dt.floor(freq)
+    book = book_df.copy()
+    book["ts"] = pd.to_datetime(book["ts"], utc=True)
+    book["_bucket"] = book["ts"].dt.floor(freq)
+    book = book[book["_bucket"].isin(candle_ts_map)]
     n_buckets = n_candles
 
     # Fractional x position — one cell per candle, centered at integer indices
@@ -390,19 +394,21 @@ def build_ob_heatmap(
     for low, high in candles[["low", "high"]].itertuples(index=False, name=None):
         low_high_masks.append((price_bins >= low) & (price_bins <= high))
 
-    # Map each book timestamp to its floor candle bucket.
-    book_rows = book_df[["ts", "bids_bucketed", "asks_bucketed"]].itertuples(index=False)
-    for row_idx, brow in enumerate(book_rows):
-        bucket_ts = book_buckets.iloc[row_idx]
-        nearest = candle_ts_map.get(bucket_ts)
+    # Use the last snapshot per candle bucket.
+    last_snapshots = book.sort_values("ts").groupby("_bucket", sort=True).tail(1)
+    for _, brow in last_snapshots[["_bucket", "mid", "bids_bucketed", "asks_bucketed"]].iterrows():
+        nearest = candle_ts_map.get(brow["_bucket"])
         if nearest is None:
             continue
 
-        bids_bucketed = cast(dict, brow.bids_bucketed) if brow.bids_bucketed is not None else {}
-        asks_bucketed = cast(dict, brow.asks_bucketed) if brow.asks_bucketed is not None else {}
+        bids_bucketed = cast(dict, brow["bids_bucketed"]) if brow["bids_bucketed"] is not None else {}
+        asks_bucketed = cast(dict, brow["asks_bucketed"]) if brow["asks_bucketed"] is not None else {}
+        mid = float(brow["mid"]) if pd.notna(brow["mid"]) else None
 
         for p_str, qty in bids_bucketed.items():
             p = float(p_str)
+            if mid is not None and p > mid:
+                continue
             pi = int((p - price_bins[0]) / price_bin)
             if 0 <= pi < len(price_bins):
                 if np.isnan(bid_hm[nearest, pi]):
@@ -411,6 +417,8 @@ def build_ob_heatmap(
 
         for p_str, qty in asks_bucketed.items():
             p = float(p_str)
+            if mid is not None and p < mid:
+                continue
             pi = int((p - price_bins[0]) / price_bin)
             if 0 <= pi < len(price_bins):
                 if np.isnan(ask_hm[nearest, pi]):
@@ -418,10 +426,12 @@ def build_ob_heatmap(
                 ask_hm[nearest, pi] += float(qty)
 
     # Mask out price bins within each candle's high-low range
-    for bi, mask in enumerate(low_high_masks):
-        if mask.any():
-            bid_hm[bi, mask] = np.nan
-            ask_hm[bi, mask] = np.nan
+    # Disabled: masks the area around current price line, making heatmap
+    # look misaligned with candles.
+    # for bi, mask in enumerate(low_high_masks):
+    #     if mask.any():
+    #         bid_hm[bi, mask] = np.nan
+    #         ask_hm[bi, mask] = np.nan
 
     return x_positions, price_bins, bid_hm, ask_hm
 
@@ -582,11 +592,18 @@ def render_footprint_chart(
     for i in range(n):
         row = candles.iloc[i]
         o, h, l, c = row["open"], row["high"], row["low"], row["close"]
-        color = UP if c >= o else DOWN
+        wick_color = CANDLE_UP if c >= o else DOWN
         xi = i + CANDLE_X_OFFSET
-        ax_main.vlines(xi, l, h, color=color, linewidth=1.0, alpha=0.85, zorder=5)
-        ax_main.bar(xi, abs(c - o), CANDLE_WIDTH, bottom=min(o, c),
-                    color=color, alpha=0.85, linewidth=0.4, edgecolor=color, zorder=5)
+        body_top = max(o, c)
+        body_bot = min(o, c)
+        # Wicks: only outside the body (not drawn inside body)
+        if h > body_top:
+            ax_main.vlines(xi, body_top, h, color=wick_color, linewidth=1.0, alpha=0.85, zorder=5)
+        if l < body_bot:
+            ax_main.vlines(xi, l, body_bot, color=wick_color, linewidth=1.0, alpha=0.85, zorder=5)
+        # Body: white translucent fill with opaque colored edge
+        ax_main.bar(xi, abs(c - o), CANDLE_WIDTH, bottom=body_bot,
+                    color=(1, 1, 1, 0.15), linewidth=1.0, edgecolor=wick_color, zorder=5)
 
     # ── Footprint heatmap (bid=green / ask=red) ──
     candle_ts_to_idx = {ts: idx for idx, ts in enumerate(candles["ts"])}
@@ -977,7 +994,7 @@ def main():
 
     end_time = trades["ts"].max()
     start_time = end_time - pd.Timedelta(hours=args.hours)
-    trades = trades[trades["ts"] >= start_time]
+    trades = trades[(trades["ts"] >= start_time) & (trades["ts"] <= end_time)]
     print(f"  filtered to {len(trades)} rows ({args.hours}h window)")
 
     print("Building footprint matrix...")
@@ -987,9 +1004,10 @@ def main():
     print("Building candles...")
     has_features = features_path.exists()
     candles = pd.DataFrame()
+    features = pd.DataFrame()
     if has_features:
         features = load_features(features_path, args.hours, cutoff=start_time)
-        features = features[features["ts"] >= start_time]
+        features = features[(features["ts"] >= start_time) & (features["ts"] <= end_time)]
         if not features.empty:
             candles = build_candles(features, args.target_minutes)
             print(f"  {len(candles)} candles from features")
@@ -1008,17 +1026,32 @@ def main():
         candles["close"] = fp_agg["high"]
         print(f"  {len(candles)} candles from trade fallback")
 
-    # Limit to display count BEFORE building OB heatmap
-    candles = candles.tail(args.candles).reset_index(drop=True)
-    print(f"  limited to {len(candles)} candles for display")
 
+    common_end_time = end_time
     print("Loading orderbook...")
     ob_data = None
     book_heatmap = None
     if book_path.exists():
         books = load_book_bucketed(book_path, args.hours, cutoff=start_time)
+        books = books[(books["ts"] >= start_time) & (books["ts"] <= end_time)]
+        if not features.empty:
+            common_end_time = min(common_end_time, features["ts"].max())
         if not books.empty:
-            ob_data = build_orderbook_depth(books, start_time, end_time)
+            common_end_time = min(common_end_time, books["ts"].max())
+        if not books.empty:
+            books = books[books["ts"] <= common_end_time]
+        if not features.empty:
+            # Rebuild candles after applying the common upper bound so the last
+            # candle close cannot use a feature tick newer than the OB snapshot.
+            features = features[features["ts"] <= common_end_time]
+            candles = build_candles(features, args.target_minutes)
+        elif not candles.empty:
+            candles = candles[candles["ts"] <= common_end_time]
+        if not candles.empty:
+            candles = candles.tail(args.candles).reset_index(drop=True)
+        print(f"  limited to {len(candles)} candles for display")
+        if not books.empty:
+            ob_data = build_orderbook_depth(books, start_time, common_end_time)
             if ob_data:
                 print(f"  OB snapshot at {ob_data['ts']}, {len(ob_data['bids'])} bids, {len(ob_data['asks'])} asks")
             else:
@@ -1046,7 +1079,7 @@ def main():
     if oi_path.exists():
         oi_df = load_oi(oi_path, args.hours, cutoff=start_time)
         if not oi_df.empty:
-            oi_df = oi_df[oi_df["ts"] >= start_time]
+            oi_df = oi_df[(oi_df["ts"] >= start_time) & (oi_df["ts"] <= common_end_time)]
             oi_data = resample_oi_to_candles(oi_df, candles, args.target_minutes)
             if oi_data is not None:
                 print(f"  OI points: {len(oi_df)}, aligned to {len(oi_data)} candles")
