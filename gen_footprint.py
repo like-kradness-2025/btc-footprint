@@ -515,6 +515,26 @@ def build_ob_heatmap(
     return x_positions, price_bins, bid_hm, ask_hm
 
 
+def _make_ob_heatmap_cmaps() -> tuple[ListedColormap, ListedColormap]:
+    """Return the bid/ask colormaps used for OB heatmap rendering."""
+    n_c = 256
+    bid_clr = np.zeros((n_c, 4))
+    ask_clr = np.zeros((n_c, 4))
+    bid_clr[:, 0] = np.linspace(0, 0.10, n_c)  # R
+    bid_clr[:, 1] = np.linspace(0, 0.75, n_c)  # G
+    bid_clr[:, 2] = np.linspace(0, 0.20, n_c)  # B
+    bid_clr[:, 3] = np.linspace(0, 1, n_c) ** 3  # A: cubic
+    ask_clr[:, 0] = np.linspace(0, 0.80, n_c)  # R
+    ask_clr[:, 1] = np.linspace(0, 0.15, n_c)  # G
+    ask_clr[:, 2] = np.linspace(0, 0.15, n_c)  # B
+    ask_clr[:, 3] = np.linspace(0, 1, n_c) ** 3  # A: cubic
+    cmap_bid = ListedColormap(bid_clr, 'bid_hm')
+    cmap_ask = ListedColormap(ask_clr, 'ask_hm')
+    cmap_bid.set_bad(alpha=0)
+    cmap_ask.set_bad(alpha=0)
+    return cmap_bid, cmap_ask
+
+
 def resample_oi_to_candles(oi_df: pd.DataFrame, candles: pd.DataFrame, interval_minutes: int) -> pd.Series | None:
     """Resample OI to match candle timestamps. Returns Series indexed by candle index (0..n-1)."""
     if oi_df.empty or candles.empty:
@@ -631,23 +651,7 @@ def render_footprint_chart(
             bid_norm = bid_hm.T / hm_bid_max
             ask_norm = ask_hm.T / hm_ask_max
 
-            # Custom colormaps: transparent at 0 → vivid color at max
-            # Cubic alpha curve: low depth nearly transparent, thick depth pops
-            n_c = 256
-            bid_clr = np.zeros((n_c, 4))
-            ask_clr = np.zeros((n_c, 4))
-            bid_clr[:, 0] = np.linspace(0, 0.10, n_c)  # R
-            bid_clr[:, 1] = np.linspace(0, 0.75, n_c)  # G
-            bid_clr[:, 2] = np.linspace(0, 0.20, n_c)  # B
-            bid_clr[:, 3] = np.linspace(0, 1, n_c) ** 3  # A: cubic
-            ask_clr[:, 0] = np.linspace(0, 0.80, n_c)  # R
-            ask_clr[:, 1] = np.linspace(0, 0.15, n_c)  # G
-            ask_clr[:, 2] = np.linspace(0, 0.15, n_c)  # B
-            ask_clr[:, 3] = np.linspace(0, 1, n_c) ** 3  # A: cubic
-            cmap_bid = ListedColormap(bid_clr, 'bid_hm')
-            cmap_ask = ListedColormap(ask_clr, 'ask_hm')
-            cmap_bid.set_bad(alpha=0)
-            cmap_ask.set_bad(alpha=0)
+            cmap_bid, cmap_ask = _make_ob_heatmap_cmaps()
 
             # Y edge positions for pcolormesh (n_bins + 1 edges)
             # Calculate y-edges from actual bin centers (use min gap for robustness)
@@ -787,44 +791,39 @@ def render_footprint_chart(
     ax_ob.tick_params(colors=MUTED, labelsize=9)
     ax_ob.set_xticks([])
     ax_ob.set_title("Orderbook", color=TEXT, fontsize=11)
-    ax_ob.set_ylim(price_lo, price_hi)
+    ax_ob.set_ylim(ax_main.get_ylim())
 
-    # Aggregate heatmap data across all displayed intervals
+    # Aggregate heatmap data across all displayed intervals, but render as heatmap cells
+    cmap_bid, cmap_ask = _make_ob_heatmap_cmaps()
     ob_rendered = False
     if book_heatmap is not None:
         _x_pos_hm, price_bins_hm, bid_hm, ask_hm = book_heatmap
         if bid_hm is not None and ask_hm is not None:
             agg_bid = np.nan_to_num(bid_hm).sum(axis=0)
             agg_ask = np.nan_to_num(ask_hm).sum(axis=0)
-            max_q = max(agg_bid.max(), agg_ask.max(), 1.0)
+            max_q = max(float(agg_bid.max()), float(agg_ask.max()), 1.0)
+            bid_norm = (agg_bid / max_q)[:, None]
+            ask_norm = (agg_ask / max_q)[:, None]
 
-            # Bar height matching heatmap bin spacing
             if len(price_bins_hm) > 1:
                 half_step = max(np.diff(price_bins_hm).min(), 1.0) / 2.0
             else:
                 half_step = ob_price_bin / 2.0
-            bar_h = half_step * 2 * 0.85
-
-            # Bid (left) and Ask (right) bars at each price level
-            bid_mask = agg_bid > 0
-            ask_mask = agg_ask > 0
-            if bid_mask.any():
-                ax_ob.barh(price_bins_hm[bid_mask],
-                           -4.0 * agg_bid[bid_mask] / max_q,
-                           height=bar_h,
-                           color=BID_GREEN, alpha=0.55, align="center", linewidth=0)
-            if ask_mask.any():
-                ax_ob.barh(price_bins_hm[ask_mask],
-                           4.0 * agg_ask[ask_mask] / max_q,
-                           height=bar_h,
-                           color=ASK_RED, alpha=0.55, align="center", linewidth=0)
+            y_edges = np.append(price_bins_hm - half_step, price_bins_hm[-1] + half_step)
+            X_bid, Y_bid = np.meshgrid(np.array([-1.0, 0.0]), y_edges)
+            X_ask, Y_ask = np.meshgrid(np.array([0.0, 1.0]), y_edges)
+            ax_ob.pcolormesh(X_bid, Y_bid, bid_norm, cmap=cmap_bid,
+                             alpha=1.0, shading='auto', zorder=0,
+                             linewidth=0, edgecolor='none')
+            ax_ob.pcolormesh(X_ask, Y_ask, ask_norm, cmap=cmap_ask,
+                             alpha=1.0, shading='auto', zorder=0,
+                             linewidth=0, edgecolor='none')
             ax_ob.axvline(0, color=TEXT, linewidth=0.4, alpha=0.3)
-            ax_ob.set_xlim(-4.5, 4.5)
+            ax_ob.set_xlim(-1.0, 1.0)
 
             ax_ob.text(0.5, 0.02, f"depth: {_fmt(max_q)}",
                        transform=ax_ob.transAxes, color=MUTED, fontsize=10,
                        ha="center", va="bottom")
-            # Only mark rendered if there is actual data to show
             if agg_bid.sum() + agg_ask.sum() > 0:
                 ob_rendered = True
 
@@ -834,25 +833,24 @@ def render_footprint_chart(
         asks = [(p, q) for p, q in ob_data["asks"] if price_lo <= p <= price_hi]
         all_q = [q for _, q in bids] + [q for _, q in asks]
         max_q = max(all_q) if all_q else 1.0
-
-        if bids:
-            prices, qties = zip(*bids)
-            ax_ob.barh(prices, [-4.0 * q / max_q for q in qties],
-                       height=ob_price_bin * 0.85,
-                       color=BID_GREEN, alpha=0.55, align="center", linewidth=0)
-        if asks:
-            prices, qties = zip(*asks)
-            ax_ob.barh(prices, [4.0 * q / max_q for q in qties],
-                       height=ob_price_bin * 0.85,
-                       color=ASK_RED, alpha=0.55, align="center", linewidth=0)
+        bid_val = sum(q for _, q in bids) / max_q if bids else 0.0
+        ask_val = sum(q for _, q in asks) / max_q if asks else 0.0
+        X_bid, Y_bid = np.meshgrid(np.array([-1.0, 0.0]), np.array([price_lo - ob_price_bin / 2.0, price_hi + ob_price_bin / 2.0]))
+        X_ask, Y_ask = np.meshgrid(np.array([0.0, 1.0]), np.array([price_lo - ob_price_bin / 2.0, price_hi + ob_price_bin / 2.0]))
+        ax_ob.pcolormesh(X_bid, Y_bid, np.array([[bid_val]]), cmap=cmap_bid,
+                         alpha=1.0, shading='auto', zorder=0,
+                         linewidth=0, edgecolor='none')
+        ax_ob.pcolormesh(X_ask, Y_ask, np.array([[ask_val]]), cmap=cmap_ask,
+                         alpha=1.0, shading='auto', zorder=0,
+                         linewidth=0, edgecolor='none')
         ax_ob.axvline(0, color=TEXT, linewidth=0.4, alpha=0.3)
-        ax_ob.set_xlim(-4.5, 4.5)
+        ax_ob.set_xlim(-1.0, 1.0)
 
         ax_ob.text(0.5, 0.02, f"depth: {_fmt(max_q)}",
                    transform=ax_ob.transAxes, color=MUTED, fontsize=10,
                    ha="center", va="bottom")
     else:
-        ax_ob.set_xlim(-4.5, 4.5)
+        ax_ob.set_xlim(-1.0, 1.0)
 
     # ── Volume Profile panel (rightmost) ──
     ax_vp.set_facecolor(NAVY)
