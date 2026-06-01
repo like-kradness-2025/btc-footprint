@@ -13,17 +13,18 @@ import requests
 
 INTERVAL_SEC = int(os.environ.get("POST_INTERVAL_SEC", "900"))  # 15分
 
-WORKDIR = Path("/home/weed420/btc-footprint")
-OUT_PATH = Path("/tmp/footprint_auto.png")
+WORKDIR = Path(os.environ.get("WORKDIR", str(Path("/home/weed420/btc-footprint"))))
+OUT_PATH = Path(os.environ.get("OUT_PATH", str(Path.home() / "footprint_auto.png")))
 WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
     "https://discord.com/api/webhooks/1487440800047693954/Eqkkm8_3uNgGHJJ2ojQGH3jC64SpS3CpVOeOMwYOHKrex6dRuz1I8AxYfRtGKdJ2aLqR",
 )
+DATA_DIR = os.environ.get("DATA_DIR", "/home/weed420/btc-receiver/data/live/")
 GEN_CMD = [
     "python3",
     "gen_footprint.py",
     "--data-dir",
-    "/home/weed420/btc-receiver/data/live/",
+    DATA_DIR,
     "--out",
     str(OUT_PATH),
     "--hours",
