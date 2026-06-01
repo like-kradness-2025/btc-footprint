@@ -226,6 +226,79 @@ def build_candles(features: pd.DataFrame, interval_minutes: int) -> pd.DataFrame
     return candles
 
 
+def build_trade_ranges(trades: pd.DataFrame, interval_minutes: int, price_bin: int) -> pd.DataFrame:
+    """Build per-interval trade ranges for candle wick expansion."""
+    if trades.empty:
+        return pd.DataFrame(columns=["ts", "trade_low", "trade_high"])
+
+    freq = f"{interval_minutes}min"
+    df = trades.copy()
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df["interval"] = df["ts"].dt.floor(freq)
+
+    if {"low_price", "high_price"}.issubset(df.columns):
+        low = pd.to_numeric(df["low_price"], errors="coerce")
+        high = pd.to_numeric(df["high_price"], errors="coerce")
+        valid = (low > 0) & (high > 0)
+        qty_col = "qty_sum" if "qty_sum" in df.columns else "qty" if "qty" in df.columns else None
+        if qty_col is not None:
+            valid &= pd.to_numeric(df[qty_col], errors="coerce").fillna(0) > 0
+        df = df[valid].copy()
+        if df.empty:
+            return pd.DataFrame(columns=["ts", "trade_low", "trade_high"])
+        df["low_price"] = pd.to_numeric(df["low_price"], errors="coerce")
+        df["high_price"] = pd.to_numeric(df["high_price"], errors="coerce")
+        if "price_bucket" in df.columns:
+            # Expand to the rendered footprint price extent so candle wicks
+            # contain the actual bucket bar, not just the raw trade extrema.
+            df["price_bucket"] = pd.to_numeric(df["price_bucket"], errors="coerce")
+            half = float(price_bin) / 2.0
+            df["trade_low"] = np.minimum(df["low_price"], df["price_bucket"] - half)
+            df["trade_high"] = np.maximum(df["high_price"], df["price_bucket"] + half)
+            ranges = df.groupby("interval").agg(trade_low=("trade_low", "min"), trade_high=("trade_high", "max")).reset_index()
+        else:
+            ranges = df.groupby("interval").agg(trade_low=("low_price", "min"), trade_high=("high_price", "max")).reset_index()
+    elif "price" in df.columns:
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
+        df = df[df["price"] > 0].copy()
+        if df.empty:
+            return pd.DataFrame(columns=["ts", "trade_low", "trade_high"])
+        # Raw trades mirror _rebucket_trades() so candle wicks contain rendered
+        # footprint bars, not just the exact trade extrema.
+        bucket = np.floor(df["price"] / float(price_bin)) * float(price_bin)
+        half = float(price_bin) / 2.0
+        df["trade_low"] = np.minimum(df["price"], bucket - half)
+        df["trade_high"] = np.maximum(df["price"], bucket + half)
+        ranges = df.groupby("interval").agg(trade_low=("trade_low", "min"), trade_high=("trade_high", "max")).reset_index()
+    elif "price_bucket" in df.columns:
+        df["price_bucket"] = pd.to_numeric(df["price_bucket"], errors="coerce")
+        qty_col = "qty_sum" if "qty_sum" in df.columns else "qty" if "qty" in df.columns else None
+        valid = df["price_bucket"] > 0
+        if qty_col is not None:
+            valid &= pd.to_numeric(df[qty_col], errors="coerce").fillna(0) > 0
+        df = df[valid].copy()
+        if df.empty:
+            return pd.DataFrame(columns=["ts", "trade_low", "trade_high"])
+        half = float(price_bin) / 2.0
+        df["trade_low"] = df["price_bucket"] - half
+        df["trade_high"] = df["price_bucket"] + half
+        ranges = df.groupby("interval").agg(trade_low=("trade_low", "min"), trade_high=("trade_high", "max")).reset_index()
+    else:
+        return pd.DataFrame(columns=["ts", "trade_low", "trade_high"])
+
+    return ranges.rename(columns={"interval": "ts"}).sort_values("ts").reset_index(drop=True)
+
+
+def expand_candles_with_trade_range(candles: pd.DataFrame, trade_ranges: pd.DataFrame) -> pd.DataFrame:
+    if candles.empty or trade_ranges.empty:
+        return candles.copy()
+
+    merged = candles.merge(trade_ranges, on="ts", how="left", sort=False)
+    merged["low"] = np.where(merged["trade_low"].notna(), np.minimum(merged["low"], merged["trade_low"]), merged["low"])
+    merged["high"] = np.where(merged["trade_high"].notna(), np.maximum(merged["high"], merged["trade_high"]), merged["high"])
+    return merged[["ts", "open", "high", "low", "close"]].copy()
+
+
 def _rebucket_trades(
     trades: pd.DataFrame,
     price_bin: int,
@@ -996,6 +1069,7 @@ def main():
     start_time = end_time - pd.Timedelta(hours=args.hours)
     trades = trades[(trades["ts"] >= start_time) & (trades["ts"] <= end_time)]
     print(f"  filtered to {len(trades)} rows ({args.hours}h window)")
+    trade_ranges = build_trade_ranges(trades, args.target_minutes, args.price_bin)
 
     print("Building footprint matrix...")
     footprint, meta = build_footprint(trades, args.target_minutes, args.price_bin)
@@ -1010,6 +1084,7 @@ def main():
         features = features[(features["ts"] >= start_time) & (features["ts"] <= end_time)]
         if not features.empty:
             candles = build_candles(features, args.target_minutes)
+            candles = expand_candles_with_trade_range(candles, trade_ranges)
             print(f"  {len(candles)} candles from features")
     else:
         print("  features file not found, skipping candles")
@@ -1045,8 +1120,10 @@ def main():
             # candle close cannot use a feature tick newer than the OB snapshot.
             features = features[features["ts"] <= common_end_time]
             candles = build_candles(features, args.target_minutes)
+            candles = expand_candles_with_trade_range(candles, trade_ranges[trade_ranges["ts"] <= common_end_time])
         elif not candles.empty:
             candles = candles[candles["ts"] <= common_end_time]
+            candles = expand_candles_with_trade_range(candles, trade_ranges[trade_ranges["ts"] <= common_end_time])
         if not candles.empty:
             candles = candles.tail(args.candles).reset_index(drop=True)
         print(f"  limited to {len(candles)} candles for display")
