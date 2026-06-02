@@ -783,7 +783,7 @@ def render_footprint_chart(
     )
     leg.get_frame().set_facecolor("black")
 
-    # ── Orderbook panel ──
+    # ── Orderbook panel (bid/ask volume bar chart) ──
     ax_ob.set_facecolor(NAVY)
     for s in ax_ob.spines.values():
         s.set_color(GRID)
@@ -793,63 +793,64 @@ def render_footprint_chart(
     ax_ob.set_title("Orderbook", color=TEXT, fontsize=11)
     ax_ob.set_ylim(ax_main.get_ylim())
 
-    # Aggregate heatmap data across all displayed intervals, but render as heatmap cells
-    cmap_bid, cmap_ask = _make_ob_heatmap_cmaps()
     ob_rendered = False
+    max_q = 1.0
+
+    # Use the global OB heatmap max (from full chart range) for x-axis scaling
+    global_max_q = max_q
     if book_heatmap is not None:
         _x_pos_hm, price_bins_hm, bid_hm, ask_hm = book_heatmap
         if bid_hm is not None and ask_hm is not None:
-            agg_bid = np.nan_to_num(bid_hm).sum(axis=0)
-            agg_ask = np.nan_to_num(ask_hm).sum(axis=0)
-            max_q = max(float(agg_bid.max()), float(agg_ask.max()), 1.0)
-            bid_norm = (agg_bid / max_q)[:, None]
-            ask_norm = (agg_ask / max_q)[:, None]
+            global_max_q = max(float(np.nanmax(bid_hm)), float(np.nanmax(ask_hm)), 1.0)
 
-            if len(price_bins_hm) > 1:
-                half_step = max(np.diff(price_bins_hm).min(), 1.0) / 2.0
-            else:
-                half_step = ob_price_bin / 2.0
-            y_edges = np.append(price_bins_hm - half_step, price_bins_hm[-1] + half_step)
-            X_bid, Y_bid = np.meshgrid(np.array([-1.0, 0.0]), y_edges)
-            X_ask, Y_ask = np.meshgrid(np.array([0.0, 1.0]), y_edges)
-            ax_ob.pcolormesh(X_bid, Y_bid, bid_norm, cmap=cmap_bid,
-                             alpha=1.0, shading='auto', zorder=0,
-                             linewidth=0, edgecolor='none')
-            ax_ob.pcolormesh(X_ask, Y_ask, ask_norm, cmap=cmap_ask,
-                             alpha=1.0, shading='auto', zorder=0,
-                             linewidth=0, edgecolor='none')
-            ax_ob.axvline(0, color=TEXT, linewidth=0.4, alpha=0.3)
-            ax_ob.set_xlim(-1.0, 1.0)
+    if ob_data and ob_data.get("bids"):
+        # Use latest orderbook snapshot
+        bids = [(p, q) for p, q in ob_data["bids"] if price_lo <= p <= price_hi]
+        asks = [(p, q) for p, q in ob_data["asks"] if price_lo <= p <= price_hi]
+        if bids or asks:
+            bd = {p: q for p, q in bids}
+            ad = {p: q for p, q in asks}
+            all_p = sorted(set(bd.keys()) | set(ad.keys()))
+            pb_bins = np.array(all_p)
+            bid_bins = np.array([bd.get(p, 0.0) for p in all_p])
+            ask_bins = np.array([ad.get(p, 0.0) for p in all_p])
+            max_q = max(float(bid_bins.max()), float(ask_bins.max()), 1.0)
 
+            # Draw horizontal bars per price level (both left from 0)
+            # Normalise against the global (full-chart) max_q so xlim reflects
+            # the main chart's depth range, not just this snapshot's top 40.
+            norm_q = max(global_max_q, max_q, 1.0)
+            max_bar = 0.95
+            bar_h = ob_price_bin * 0.75 if len(all_p) > 1 else ob_price_bin * 0.5
+            for pb, bq, aq in zip(all_p, bid_bins, ask_bins):
+                matched = min(bq, aq)
+                delta = abs(bq - aq)
+                dc = BID_GREEN if bq >= aq else ASK_RED
+
+                right_pos = 0.0
+                # Matched portion (neutral)
+                if matched > 0:
+                    mw = max_bar * (matched / norm_q)
+                    ax_ob.barh(pb, mw, height=bar_h, left=-mw,
+                               color=MUTED, alpha=0.45, align="center",
+                               linewidth=0, zorder=3)
+                    right_pos -= mw
+                # Delta portion (dominant side color)
+                if delta > 0:
+                    dw = max_bar * (delta / norm_q)
+                    ax_ob.barh(pb, dw, height=bar_h, left=right_pos - dw,
+                               color=dc, alpha=0.75, align="center",
+                               linewidth=0, zorder=3)
+
+            ax_ob.axvline(0, color=TEXT, linewidth=0.5, alpha=0.35)
+            xlim_left = -(max_bar + 0.10)
+            ax_ob.set_xlim(xlim_left, 0)
             ax_ob.text(0.5, 0.02, f"depth: {_fmt(max_q)}",
                        transform=ax_ob.transAxes, color=MUTED, fontsize=10,
                        ha="center", va="bottom")
-            if agg_bid.sum() + agg_ask.sum() > 0:
-                ob_rendered = True
+            ob_rendered = True
 
-    if not ob_rendered and ob_data and ob_data.get("bids"):
-        # Fallback: latest snapshot (no heatmap available)
-        bids = [(p, q) for p, q in ob_data["bids"] if price_lo <= p <= price_hi]
-        asks = [(p, q) for p, q in ob_data["asks"] if price_lo <= p <= price_hi]
-        all_q = [q for _, q in bids] + [q for _, q in asks]
-        max_q = max(all_q) if all_q else 1.0
-        bid_val = sum(q for _, q in bids) / max_q if bids else 0.0
-        ask_val = sum(q for _, q in asks) / max_q if asks else 0.0
-        X_bid, Y_bid = np.meshgrid(np.array([-1.0, 0.0]), np.array([price_lo - ob_price_bin / 2.0, price_hi + ob_price_bin / 2.0]))
-        X_ask, Y_ask = np.meshgrid(np.array([0.0, 1.0]), np.array([price_lo - ob_price_bin / 2.0, price_hi + ob_price_bin / 2.0]))
-        ax_ob.pcolormesh(X_bid, Y_bid, np.array([[bid_val]]), cmap=cmap_bid,
-                         alpha=1.0, shading='auto', zorder=0,
-                         linewidth=0, edgecolor='none')
-        ax_ob.pcolormesh(X_ask, Y_ask, np.array([[ask_val]]), cmap=cmap_ask,
-                         alpha=1.0, shading='auto', zorder=0,
-                         linewidth=0, edgecolor='none')
-        ax_ob.axvline(0, color=TEXT, linewidth=0.4, alpha=0.3)
-        ax_ob.set_xlim(-1.0, 1.0)
-
-        ax_ob.text(0.5, 0.02, f"depth: {_fmt(max_q)}",
-                   transform=ax_ob.transAxes, color=MUTED, fontsize=10,
-                   ha="center", va="bottom")
-    else:
+    if not ob_rendered:
         ax_ob.set_xlim(-1.0, 1.0)
 
     # ── Volume Profile panel (rightmost) ──
@@ -887,13 +888,13 @@ def render_footprint_chart(
                                    height=ob_price_bin * 0.85,
                                    color=dc, alpha=0.55, align="center", linewidth=0)
                 ax_vp.axvline(0, color=TEXT, linewidth=0.4, alpha=0.3)
-                ax_vp.set_xlim(-4.5, 4.5)
+                ax_vp.set_xlim(0, 4.5)
                 ax_vp.text(0.5, 0.02, f"max: {_fmt(max_total)}",
                            transform=ax_vp.transAxes, color=MUTED, fontsize=8,
                            ha="center", va="bottom")
                 vp_has_data = True
     if not locals().get("vp_has_data"):
-        ax_vp.set_xlim(-4.5, 4.5)
+        ax_vp.set_xlim(0, 4.5)
 
     # ── Volume ──
     ax_vol.set_facecolor(NAVY)
