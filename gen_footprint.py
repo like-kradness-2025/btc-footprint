@@ -1157,6 +1157,9 @@ def main():
             common_end_time = min(common_end_time, features["ts"].max())
         if not books.empty:
             common_end_time = min(common_end_time, books["ts"].max())
+        # Snap to the next interval boundary so the last completed candle
+        # is fully bounded and does not change when new data arrives.
+        common_end_time = pd.Timestamp(common_end_time).ceil(f"{args.target_minutes}min")
         if not books.empty:
             books = books[books["ts"] <= common_end_time]
         if not features.empty:
